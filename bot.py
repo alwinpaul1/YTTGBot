@@ -487,11 +487,15 @@ async def handle_message(
                         f"{file_size // (1024*1024)}MB) to {chat_id}"
                     )
                     try:
-                        # Renamed to avoid conflict
+                        # Send with explicit filename and title
+                        # Get title without extension for display
+                        title_without_ext = os.path.splitext(os.path.basename(audio_file_path))[0]
                         with open(audio_file_path, "rb") as audio_file_obj:
                             await context.bot.send_audio(
                                 chat_id=chat_id,
                                 audio=audio_file_obj,
+                                filename=os.path.basename(audio_file_path),
+                                title=title_without_ext,
                                 read_timeout=180,
                                 write_timeout=180,
                                 connect_timeout=180,
@@ -647,6 +651,29 @@ async def handle_message(
         )
 
 
+def sanitize_filename(title: str, max_length: int = 200) -> str:
+    """
+    Sanitize a video title to create a safe filename.
+    Keeps spaces but removes/replaces problematic characters.
+    """
+    # Characters that are not allowed in filenames
+    invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+
+    # Replace invalid characters with nothing or space
+    sanitized = title
+    for char in invalid_chars:
+        sanitized = sanitized.replace(char, '')
+
+    # Replace multiple spaces with single space
+    sanitized = ' '.join(sanitized.split())
+
+    # Trim to max length (leaving room for .mp3 extension)
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length].strip()
+
+    return sanitized
+
+
 async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     """
     Download a YouTube video and convert it to an MP3 file.
@@ -655,11 +682,10 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     FFmpeg to convert it into an MP3 audio file. It tries multiple
     strategies to ensure the download is successful.
     """
-    # Output template for yt-dlp before FFmpeg processing.
-    # FFmpeg will add the .mp3
+    # Download with video_id first, then rename to title
     base_output_template = f"{video_id}"
-    # The final path we expect after FFmpeg has converted it to mp3
-    expected_final_path = f"{base_output_template}.mp3"
+    temp_final_path = f"{base_output_template}.mp3"
+    expected_final_path = None
 
     # Optimized strategy - using the proven working method
     # (Firefox cookies + TV client)
@@ -744,14 +770,35 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
             )
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+                info = ydl.extract_info(url, download=True)
+                # Get the video title and sanitize it
+                if info:
+                    video_title = info.get('title', video_id)
+                    sanitized_title = sanitize_filename(video_title)
+                    expected_final_path = f"{sanitized_title}.mp3"
 
             logger.info(
                 f"yt-dlp download & FFmpeg conversion for {url} completed "
                 f"using strategy '{strategy['name']}'."
             )
 
-            if os.path.exists(expected_final_path):
+            # Check if the temp file exists and rename it
+            if os.path.exists(temp_final_path):
+                # Rename from video_id.mp3 to sanitized_title.mp3
+                try:
+                    os.rename(temp_final_path, expected_final_path)
+                    logger.info(
+                        f"Renamed file from {temp_final_path} to "
+                        f"{expected_final_path}"
+                    )
+                except OSError as e_rename:
+                    logger.warning(
+                        f"Could not rename file: {e_rename}. "
+                        f"Using original filename."
+                    )
+                    expected_final_path = temp_final_path
+
+            if expected_final_path and os.path.exists(expected_final_path):
                 logger.info(
                     "Conversion successful. MP3 file created: "
                     f"{expected_final_path}"
@@ -759,28 +806,9 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
                 return expected_final_path
             else:
                 logger.error(
-                    "CRITICAL: Expected MP3 file "
-                    f"{expected_final_path} was NOT found after FFmpeg "
+                    "CRITICAL: No MP3 file was found after FFmpeg "
                     f"processing for {url}."
                 )
-                # Check if the pre-ffmpeg file exists
-                # (e.g., video_id.webm or video_id.m4a)
-                # This might give a clue if FFmpeg failed or was skipped.
-                downloaded_files_before_ffmpeg = [
-                    f
-                    for f in os.listdir(".")
-                    if f.startswith(video_id) and not f.endswith(".mp3")
-                ]
-                if downloaded_files_before_ffmpeg:
-                    logger.error(
-                        "Found these files that might be pre-FFmpeg output: "
-                        f"{downloaded_files_before_ffmpeg}"
-                    )
-                else:
-                    logger.error(
-                        "No intermediate files (like "
-                        f"{video_id}.webm/m4a) found either."
-                    )
 
                 try:
                     current_dir_files = os.listdir(".")
@@ -831,25 +859,8 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
                 f"for {url}: {e}",
                 exc_info=True,
             )
-            if os.path.exists(expected_final_path):  # Clean up
+            if expected_final_path and os.path.exists(expected_final_path):
                 os.remove(expected_final_path)
-            # Also clean up any intermediate files yt-dlp might have
-            # left if FFmpeg errored
-            intermediate_files = [
-                f
-                for f in os.listdir(".")
-                if f.startswith(base_output_template)
-                and f != expected_final_path
-            ]
-            for int_file in intermediate_files:
-                try:
-                    os.remove(int_file)
-                    logger.info(f"Cleaned up intermediate file: {int_file}")
-                except OSError as e_rem_int:
-                    logger.error(
-                        f"Error removing intermediate file {int_file}: "
-                        f"{e_rem_int}"
-                    )
             return None
 
         except Exception as e:
@@ -871,26 +882,8 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
                 f"{e}",
                 exc_info=True,
             )
-            if os.path.exists(expected_final_path):
+            if expected_final_path and os.path.exists(expected_final_path):
                 os.remove(expected_final_path)
-            intermediate_files = [
-                f
-                for f in os.listdir(".")
-                if f.startswith(base_output_template)
-                and f != expected_final_path
-            ]
-            for int_file in intermediate_files:
-                try:
-                    os.remove(int_file)
-                    logger.info(
-                        f"Cleaned up intermediate file: {int_file} on "
-                        "general error."
-                    )
-                except OSError as e_rem_int_gen:
-                    logger.error(
-                        f"Error removing intermediate file {int_file} on "
-                        f"general error: {e_rem_int_gen}"
-                    )
             return None
 
     # If we get here, all strategies failed
