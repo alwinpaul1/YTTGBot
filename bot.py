@@ -36,10 +36,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Regex to find YouTube URLs
+# Regex to find YouTube URLs (including Shorts)
 YOUTUBE_URL_REGEX = (
     r"(?:https?:\/\/)?(?:www\.)?"
-    r"(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w\-]+)"
+    r"(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([\w\-]+)"
 )
 
 # This dictionary will store the last update time for each chat_id to
