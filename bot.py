@@ -1218,10 +1218,16 @@ async def download_youtube_video(url: str, video_id: str, height: int) -> str | 
         "geo_bypass": True,
     }
     
-    # Try with browser cookies first, then fallback
+    # Try different strategies - use player clients that work without authentication
     strategies = [
-        {"cookiesfrombrowser": ("firefox",)},
-        {"extractor_args": {"youtube": {"player_client": ["android", "web"]}}},
+        # iOS client works without PO Token 
+        {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
+        # TV client also works without authentication
+        {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
+        # Web safari as fallback
+        {"extractor_args": {"youtube": {"player_client": ["web_safari"]}}},
+        # Basic fallback with no specific client
+        {},
     ]
     
     for strategy in strategies:
