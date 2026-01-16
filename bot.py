@@ -162,7 +162,7 @@ async def get_available_qualities(url: str) -> list[dict]:
                         if label not in seen_labels:
                             seen_labels.add(label)
                             available_qualities.append({
-                                "height": quality_height,
+                                "height": height,  # Use actual detected height for precise download
                                 "label": label,
                             })
                 
@@ -1264,23 +1264,16 @@ def download_youtube_video(url: str, video_id: str, height: int, progress_hooks:
     base_output_template = f"{video_id}_video"
     expected_final_path = None
     
-    # Map standard heights to actual height UPPER bounds for widescreen videos
-    # These are the maximum heights for each quality level
-    height_map = {
-        2160: 2000,  # 4K - max height (actual ~1610)
-        1440: 1200,  # 1440p - max height (actual ~1074)
-        1080: 900,   # 1080p - max height (actual ~806)
-        720: 600,    # 720p - max height (actual ~536)
-        480: 400,    # 480p - max height (actual ~358)
-        360: 300,    # 360p - max height (actual ~268)
-        240: 200,    # 240p - max height (actual ~178)
-        144: 180,    # 144p - max height (actual ~128)
-    }
+    base_output_template = f"{video_id}_video"
+    expected_final_path = None
     
-    max_height = height_map.get(height, height)
+    # Use precise height matching since we now pass the actual detected height
+    # We use a small tolerance range (+/- 2px) to be safe against minor reporting differences
+    min_h = height - 2
+    max_h = height + 2
     
-    # Format string to get BEST video at or BELOW the selected quality + best audio
-    format_string = f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+    # Format string to get video within specific height range + best audio
+    format_string = f"bestvideo[height>={min_h}][height<={max_h}]+bestaudio/best[height>={min_h}][height<={max_h}]/best"
     
     # Use provided hooks or empty list
     hooks = progress_hooks if progress_hooks else []
