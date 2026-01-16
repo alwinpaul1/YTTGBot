@@ -548,8 +548,9 @@ async def button_callback_handler(
                     "❌ Cancelling... Please wait.",
                 )
             else:
+                keys_str = str(list(active_operations.keys()))
                 await query.edit_message_text(
-                    "No active operation to cancel.",
+                    f"No active operation to cancel. Active: {keys_str}",
                     reply_markup=get_info_inline_keyboard(),
                 )
 
