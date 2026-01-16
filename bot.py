@@ -548,7 +548,6 @@ async def button_callback_handler(
                     "❌ Cancelling... Please wait.",
                 )
             else:
-                logger.debug(f"Cancel failed. chat_id {cancel_chat_id} not in active_operations. Keys: {list(active_operations.keys())}")
                 await query.edit_message_text(
                     "No active operation to cancel.",
                     reply_markup=get_info_inline_keyboard(),
@@ -772,7 +771,6 @@ async def process_audio_download(
 
     # Register this operation as active (for cancellation support)
     active_operations[chat_id] = {"cancelled": False, "file_path": None}
-    logger.debug(f"Registered active operation for chat_id {chat_id}. Keys: {list(active_operations.keys())}")
 
     try:
         # Edit the original message to show processing status with cancel button
@@ -934,8 +932,7 @@ async def process_audio_download(
 
     finally:
         # Clean up active operation
-        removed = active_operations.pop(chat_id, None)
-        logger.debug(f"Removing active operation for chat_id {chat_id} in process_audio_download finally. Removed: {removed}")
+        active_operations.pop(chat_id, None)
 
         # Cleanup temp file
         if audio_file_path and os.path.exists(audio_file_path):
@@ -1189,8 +1186,7 @@ async def process_video_download(
     
     finally:
         # Clean up active operation
-        removed = active_operations.pop(chat_id, None)
-        logger.debug(f"Removing active operation for chat_id {chat_id} in process_video_download finally. Removed: {removed}")
+        active_operations.pop(chat_id, None)
 
         # Cleanup temp file
         if video_file_path and os.path.exists(video_file_path):
