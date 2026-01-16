@@ -138,7 +138,7 @@ def get_info_inline_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton(
-                "📝 How to Send a Link", callback_data="show_link_instructions"
+                "How to Send a Link", callback_data="show_link_instructions"
             )
         ]
     ]
@@ -150,17 +150,17 @@ def get_format_selection_keyboard(video_id: str) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton(
-                "🎵 Download Audio (MP3)", callback_data=f"download_audio:{video_id}"
+                "Download Audio (MP3)", callback_data=f"download_audio:{video_id}"
             )
         ],
         [
             InlineKeyboardButton(
-                "🎬 Download Video", callback_data=f"download_video:{video_id}"
+                "Download Video", callback_data=f"download_video:{video_id}"
             )
         ],
         [
             InlineKeyboardButton(
-                "❌ Cancel", callback_data=f"cancel:{video_id}"
+                "Cancel", callback_data=f"cancel:{video_id}"
             )
         ],
     ]
@@ -172,7 +172,7 @@ def get_cancel_keyboard(chat_id: int, video_id: str) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton(
-                "❌ Cancel", callback_data=f"cancel_operation:{chat_id}:{video_id}"
+                "Cancel", callback_data=f"cancel_operation:{chat_id}:{video_id}"
             )
         ]
     ]
@@ -325,13 +325,13 @@ def get_video_quality_keyboard(video_id: str, qualities: list[dict]) -> InlineKe
         quality_num = label.split("p")[0]
         keyboard.append([
             InlineKeyboardButton(
-                f"📹 {label}", callback_data=f"quality:{video_id}:{quality_num}"
+                f"{label}", callback_data=f"quality:{video_id}:{quality_num}"
             )
         ])
     
     # Add back button
     keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data=f"back_to_format:{video_id}")
+        InlineKeyboardButton("Back", callback_data=f"back_to_format:{video_id}")
     ])
     
     return InlineKeyboardMarkup(keyboard)
@@ -399,7 +399,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{update.effective_user.id if update.effective_user else 'N/A'}"
     )
     await update.message.reply_text(
-        "Hi! 🎬 I can download YouTube videos as **audio (MP3)** or **video** files.\n\n"
+        "Hi! I can download YouTube videos as **audio (MP3)** or **video** files.\n\n"
         "Simply paste a YouTube video link and send it to me!",
         parse_mode="Markdown",
         reply_markup=get_info_inline_keyboard(),  # Show the single button
@@ -505,7 +505,7 @@ async def button_callback_handler(
             
             if not youtube_url:
                 await query.edit_message_text(
-                    "❌ Session expired. Please send the YouTube link again."
+                    "Session expired. Please send the YouTube link again."
                 )
                 return
             
@@ -528,21 +528,21 @@ async def button_callback_handler(
             
             if not youtube_url:
                 await query.edit_message_text(
-                    "❌ Session expired. Please send the YouTube link again."
+                    "Session expired. Please send the YouTube link again."
                 )
                 return
             
             logger.info(f"Video download requested for video_id: {video_id}")
             
             # Show loading message while fetching qualities
-            await query.edit_message_text("🔍 Fetching available qualities...")
+            await query.edit_message_text("Fetching available qualities...")
             
             # Get available qualities
             qualities = await get_available_qualities(youtube_url)
             
             if qualities:
                 await query.edit_message_text(
-                    "📹 **Select Video Quality:**",
+                    "**Select Video Quality:**",
                     parse_mode="Markdown",
                     reply_markup=get_video_quality_keyboard(video_id, qualities),
                 )
@@ -554,7 +554,7 @@ async def button_callback_handler(
                     {"height": 360, "label": "360p"},
                 ]
                 await query.edit_message_text(
-                    "📹 **Select Video Quality:**\n_(Couldn't detect available qualities)_",
+                    "**Select Video Quality:**\n_(Couldn't detect available qualities)_",
                     parse_mode="Markdown",
                     reply_markup=get_video_quality_keyboard(video_id, default_qualities),
                 )
@@ -569,7 +569,7 @@ async def button_callback_handler(
 
             if not youtube_url:
                 await query.edit_message_text(
-                    "❌ Session expired. Please send the YouTube link again."
+                    "Session expired. Please send the YouTube link again."
                 )
                 return
 
@@ -590,12 +590,12 @@ async def button_callback_handler(
             
             if video_id not in pending_video_urls:
                 await query.edit_message_text(
-                    "❌ Session expired. Please send the YouTube link again."
+                    "Session expired. Please send the YouTube link again."
                 )
                 return
             
             await query.edit_message_text(
-                "🎬 **YouTube Link Detected!**\n\n"
+                "**YouTube Link Detected!**\n\n"
                 "Choose download format:",
                 parse_mode="Markdown",
                 reply_markup=get_format_selection_keyboard(video_id),
@@ -610,7 +610,7 @@ async def button_callback_handler(
 
             # Show the welcome/start menu
             await query.edit_message_text(
-                "Hi! 🎬 I can download YouTube videos as **audio (MP3)** or **video** files.\n\n"
+                "Hi! I can download YouTube videos as **audio (MP3)** or **video** files.\n\n"
                 "Simply paste a YouTube video link and send it to me!",
                 parse_mode="Markdown",
                 reply_markup=get_info_inline_keyboard(),
@@ -630,7 +630,7 @@ async def button_callback_handler(
                 logger.info(f"Cancel requested for chat_id: {cancel_chat_id}, video_id: {cancel_video_id}")
 
                 await query.edit_message_text(
-                    "❌ Cancelling... Please wait.",
+                    "Cancelling... Please wait.",
                 )
             else:
                 keys_str = str(list(active_operations.keys()))
@@ -831,7 +831,7 @@ async def handle_message(
         
         # Show format selection keyboard
         await update.message.reply_text(
-            "🎬 **YouTube Link Detected!**\n\n"
+            "**YouTube Link Detected!**\n\n"
             "Choose download format:",
             parse_mode="Markdown",
             reply_markup=get_format_selection_keyboard(video_id),
@@ -872,7 +872,7 @@ async def process_audio_download(
         if download_semaphore.locked():
             try:
                 await query.edit_message_text(
-                    "⏳ Waiting in queue... Your download will start shortly.",
+                    "Waiting in queue... Your download will start shortly.",
                     reply_markup=get_cancel_keyboard(chat_id, video_id)
                 )
                 processing_message = query.message
@@ -886,7 +886,7 @@ async def process_audio_download(
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "❌ Download cancelled.",
+                            "Download cancelled.",
                             reply_markup=get_info_inline_keyboard()
                         )
                     except Exception:
@@ -912,19 +912,19 @@ async def process_audio_download(
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            f"❌ {error_message}",
+                            f"{error_message}",
                             reply_markup=get_info_inline_keyboard()
                         )
                     except Exception:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"❌ {error_message}",
+                            text=f"{error_message}",
                             reply_markup=get_info_inline_keyboard(),
                         )
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"❌ {error_message}",
+                        text=f"{error_message}",
                         reply_markup=get_info_inline_keyboard(),
                     )
                 return
@@ -944,7 +944,7 @@ async def process_audio_download(
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "❌ Download cancelled.",
+                            "Download cancelled.",
                             reply_markup=get_info_inline_keyboard()
                         )
                     except Exception:
@@ -975,7 +975,7 @@ async def process_audio_download(
                         context.bot,
                         processing_message,
                         video_id,
-                        caption=f"🎵 Audio from YouTube",
+                        caption=f"Audio from YouTube",
                     )
 
                     # Check if cancelled during upload
@@ -983,7 +983,7 @@ async def process_audio_download(
                         if processing_message:
                             try:
                                 await processing_message.edit_text(
-                                    "❌ Upload cancelled.",
+                                    "Upload cancelled.",
                                     reply_markup=get_info_inline_keyboard()
                                 )
                             except Exception:
@@ -999,13 +999,13 @@ async def process_audio_download(
                                 pass
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text="✅ Large audio sent! Send another link to download.",
+                            text="Large audio sent! Send another link to download.",
                             reply_markup=get_info_inline_keyboard(),
                         )
                     else:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text="❌ Failed to send large audio file.",
+                            text="Failed to send large audio file.",
                             reply_markup=get_info_inline_keyboard(),
                         )
                 else:
@@ -1040,14 +1040,14 @@ async def process_audio_download(
                                 pass
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text="✅ Audio sent! Send another link to download.",
+                            text="Audio sent! Send another link to download.",
                             reply_markup=get_info_inline_keyboard(),
                         )
                     except Exception as e_send:
                         logger.error(f"Failed to send audio: {e_send}", exc_info=True)
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"❌ Error sending audio: {e_send}",
+                            text=f"Error sending audio: {e_send}",
                             reply_markup=get_info_inline_keyboard(),
                         )
             else:
@@ -1055,7 +1055,7 @@ async def process_audio_download(
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "❌ Couldn't process YouTube link. Try again later.",
+                            "Couldn't process YouTube link. Try again later.",
                             reply_markup=get_info_inline_keyboard()
                         )
                     except Exception:
@@ -1063,7 +1063,7 @@ async def process_audio_download(
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="❌ Couldn't process YouTube link. Try again later.",
+                        text="Couldn't process YouTube link. Try again later.",
                         reply_markup=get_info_inline_keyboard(),
                     )
 
@@ -1071,7 +1071,7 @@ async def process_audio_download(
         logger.error(f"Error in process_audio_download: {e}", exc_info=True)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ An error occurred: {e}",
+            text=f"An error occurred: {e}",
             reply_markup=get_info_inline_keyboard(),
         )
 
@@ -1110,7 +1110,7 @@ async def process_video_download(
         if download_semaphore.locked():
             try:
                 await query.edit_message_text(
-                    "⏳ Waiting in queue... Your download will start shortly.",
+                    "Waiting in queue... Your download will start shortly.",
                     reply_markup=get_cancel_keyboard(chat_id, video_id)
                 )
                 processing_message = query.message
@@ -1124,7 +1124,7 @@ async def process_video_download(
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "❌ Download cancelled.",
+                            "Download cancelled.",
                             reply_markup=get_info_inline_keyboard()
                         )
                     except Exception:
@@ -1194,7 +1194,7 @@ async def process_video_download(
                     if processing_message:
                         try:
                             await processing_message.edit_text(
-                                "❌ Download cancelled.",
+                                "Download cancelled.",
                                 reply_markup=get_info_inline_keyboard()
                             )
                         except Exception:
@@ -1225,19 +1225,19 @@ async def process_video_download(
                     if processing_message:
                         try:
                             await processing_message.edit_text(
-                                f"❌ {error_message}",
+                                f"{error_message}",
                                 reply_markup=get_info_inline_keyboard()
                             )
                         except Exception:
                             await context.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"❌ {error_message}",
+                                text=f"{error_message}",
                                 reply_markup=get_info_inline_keyboard(),
                             )
                     else:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"❌ {error_message}",
+                            text=f"{error_message}",
                             reply_markup=get_info_inline_keyboard(),
                         )
                     return
@@ -1258,7 +1258,7 @@ async def process_video_download(
                 if file_size > TELEGRAM_VIDEO_LIMIT_BYTES:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"❌ Video is too large ({file_size_mb}MB). Telegram limit is 2GB.",
+                        text=f"Video is too large ({file_size_mb}MB). Telegram limit is 2GB.",
                         reply_markup=get_info_inline_keyboard(),
                     )
                     return
@@ -1281,7 +1281,7 @@ async def process_video_download(
                         context.bot,
                         processing_message,
                         video_id,
-                        caption=f"🎬 {quality}p video from YouTube",
+                        caption=f"{quality}p video from YouTube",
                     )
 
                     # Check if cancelled during upload
@@ -1289,7 +1289,7 @@ async def process_video_download(
                         if processing_message:
                             try:
                                 await processing_message.edit_text(
-                                    "❌ Upload cancelled.",
+                                    "Upload cancelled.",
                                     reply_markup=get_info_inline_keyboard()
                                 )
                             except Exception:
@@ -1305,13 +1305,13 @@ async def process_video_download(
                                 pass
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text="✅ Video sent! Send another link to download.",
+                            text="Video sent! Send another link to download.",
                             reply_markup=get_info_inline_keyboard(),
                         )
                     else:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text="❌ Failed to send video file.",
+                            text="Failed to send video file.",
                             reply_markup=get_info_inline_keyboard(),
                         )
                 else:
@@ -1332,7 +1332,7 @@ async def process_video_download(
                                 chat_id=chat_id,
                                 video=video_file_obj,
                                 filename=os.path.basename(video_file_path),
-                                caption=f"🎬 {quality}p video",
+                                caption=f"{quality}p video",
                                 read_timeout=300,
                                 write_timeout=300,
                                 connect_timeout=180,
@@ -1346,14 +1346,14 @@ async def process_video_download(
                                 pass
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text="✅ Video sent! Send another link to download.",
+                            text="Video sent! Send another link to download.",
                             reply_markup=get_info_inline_keyboard(),
                         )
                     except Exception as e_send:
                         logger.error(f"Failed to send video: {e_send}", exc_info=True)
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"❌ Error sending video: {e_send}",
+                            text=f"Error sending video: {e_send}",
                             reply_markup=get_info_inline_keyboard(),
                         )
             else:
@@ -1361,14 +1361,14 @@ async def process_video_download(
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "❌ Couldn't download video. Try a different quality or try again later."
+                            "Couldn't download video. Try a different quality or try again later."
                         )
                     except Exception:
                         pass
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="❌ Couldn't download video. Try again later.",
+                        text="Couldn't download video. Try again later.",
                         reply_markup=get_info_inline_keyboard(),
                     )
     
@@ -1376,7 +1376,7 @@ async def process_video_download(
         logger.error(f"Error in process_video_download: {e}", exc_info=True)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ An error occurred: {e}",
+            text=f"An error occurred: {e}",
             reply_markup=get_info_inline_keyboard(),
         )
     
@@ -1588,7 +1588,12 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
                 logger.info(f"YouTube error detected, showing to user: {error_msg}")
                 if expected_final_path and os.path.exists(expected_final_path):
                     os.remove(expected_final_path)
-                raise YouTubeError(error_msg)
+                # Trim the error - only show first line (before country list or extra details)
+                first_line = error_msg.split('\n')[0]
+                # Also trim if there's "This video is available in" list
+                if "This video is available in" in first_line:
+                    first_line = first_line.split("This video is available in")[0].strip()
+                raise YouTubeError(first_line)
 
             # Check for specific error types and decide whether to continue
             if i < len(download_strategies) - 1:  # Not the last strategy
@@ -1738,7 +1743,12 @@ def download_youtube_video(url: str, video_id: str, quality: int, progress_hooks
         logger.error(f"Video download failed: {e}")
         # Check if this is a YouTube error that should be shown to user
         if "ERROR: [youtube]" in error_msg:
-            raise YouTubeError(error_msg)
+            # Trim the error - only show first line (before country list or extra details)
+            first_line = error_msg.split('\n')[0]
+            # Also trim if there's "This video is available in" list
+            if "This video is available in" in first_line:
+                first_line = first_line.split("This video is available in")[0].strip()
+            raise YouTubeError(first_line)
     except Exception as e:
         logger.error(f"Error downloading video: {e}", exc_info=True)
 
