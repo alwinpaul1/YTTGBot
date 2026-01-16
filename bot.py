@@ -124,11 +124,8 @@ async def get_available_qualities(url: str) -> list[dict]:
                     continue
                 
                 formats = info.get("formats", [])
-                
-                # Standard quality options we want to show (including 4K)
-                standard_heights = [2160, 1440, 1080, 720, 480, 360, 240, 144]
                 available_qualities = []
-                seen_heights = set()
+                seen_labels = set()
                 
                 # Get all video formats with height info
                 video_formats = [
@@ -137,26 +134,34 @@ async def get_available_qualities(url: str) -> list[dict]:
                 ]
                 video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
                 
+                # Height ranges for widescreen videos (2.39:1 aspect ratio)
+                # Maps actual heights to standard quality labels
+                def get_quality_label(height):
+                    if height >= 1400:  # 1440p+ (actual 1074-1610)
+                        if height >= 2000 or height >= 1500:  # Very tall = 4K
+                            return (2160, "2160p 4K")
+                        return (1440, "1440p 2K")
+                    elif height >= 700:  # 720p-1080p (actual 536-806)
+                        if height >= 800:
+                            return (1080, "1080p HD")
+                        return (720, "720p HD")
+                    elif height >= 350:  # 480p (actual 358)
+                        return (480, "480p")
+                    elif height >= 250:  # 360p (actual 268)
+                        return (360, "360p")
+                    elif height >= 170:  # 240p (actual 178)
+                        return (240, "240p")
+                    else:  # 144p (actual 128)
+                        return (144, "144p")
+                
                 for fmt in video_formats:
                     height = fmt.get("height")
-                    if height and height not in seen_heights:
-                        # Find the closest standard height
-                        closest_height = min(standard_heights, key=lambda x: abs(x - height))
-                        if abs(closest_height - height) <= 20 and closest_height not in seen_heights:
-                            seen_heights.add(closest_height)
-                            
-                            # Determine label based on height
-                            if closest_height >= 2160:
-                                label = f"{closest_height}p 4K"
-                            elif closest_height >= 1440:
-                                label = f"{closest_height}p 2K"
-                            elif closest_height >= 720:
-                                label = f"{closest_height}p HD"
-                            else:
-                                label = f"{closest_height}p"
-                            
+                    if height:
+                        quality_height, label = get_quality_label(height)
+                        if label not in seen_labels:
+                            seen_labels.add(label)
                             available_qualities.append({
-                                "height": closest_height,
+                                "height": quality_height,
                                 "label": label,
                             })
                 
