@@ -46,6 +46,9 @@ YOUTUBE_URL_REGEX = (
 # limit edits.
 progress_message_last_edit_time = {}
 
+# Store pending video URLs for quality selection (video_id -> url)
+pending_video_urls = {}
+
 
 # --- Simplified Inline Keyboard ---
 def get_info_inline_keyboard() -> InlineKeyboardMarkup:
@@ -57,6 +60,146 @@ def get_info_inline_keyboard() -> InlineKeyboardMarkup:
             )
         ]
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_format_selection_keyboard(video_id: str) -> InlineKeyboardMarkup:
+    """Return inline keyboard to choose between audio or video download."""
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🎵 Download Audio (MP3)", callback_data=f"download_audio:{video_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎬 Download Video", callback_data=f"download_video:{video_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Cancel", callback_data=f"cancel:{video_id}"
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def get_available_qualities(url: str) -> list[dict]:
+    """
+    Fetch available video qualities from YouTube.
+    Returns a list of dicts with height and label.
+    Uses player clients that don't require authentication.
+    """
+    # Try different player clients that work without authentication
+    ydl_opts_list = [
+        {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": False,
+            "extractor_args": {
+                "youtube": {"player_client": ["ios", "web"]}
+            },
+        },
+        {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": False,
+            "extractor_args": {
+                "youtube": {"player_client": ["android_creator", "web"]}
+            },
+        },
+        {
+            "quiet": True, 
+            "no_warnings": True,
+            "extract_flat": False,
+        },
+    ]
+    
+    for ydl_opts in ydl_opts_list:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    continue
+                
+                formats = info.get("formats", [])
+                
+                # Standard quality options we want to show (including 4K)
+                standard_heights = [2160, 1440, 1080, 720, 480, 360, 240, 144]
+                available_qualities = []
+                seen_heights = set()
+                
+                # Get all video formats with height info
+                video_formats = [
+                    f for f in formats 
+                    if f.get("vcodec") != "none" and f.get("height")
+                ]
+                video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
+                
+                for fmt in video_formats:
+                    height = fmt.get("height")
+                    if height and height not in seen_heights:
+                        # Find the closest standard height
+                        closest_height = min(standard_heights, key=lambda x: abs(x - height))
+                        if abs(closest_height - height) <= 20 and closest_height not in seen_heights:
+                            seen_heights.add(closest_height)
+                            
+                            # Determine label based on height
+                            if closest_height >= 2160:
+                                label = f"{closest_height}p 4K"
+                            elif closest_height >= 1440:
+                                label = f"{closest_height}p 2K"
+                            elif closest_height >= 720:
+                                label = f"{closest_height}p HD"
+                            else:
+                                label = f"{closest_height}p"
+                            
+                            available_qualities.append({
+                                "height": closest_height,
+                                "label": label,
+                            })
+                
+                # Sort by height descending
+                available_qualities.sort(key=lambda x: x["height"], reverse=True)
+                
+                if available_qualities:
+                    logger.info(f"Found {len(available_qualities)} quality options for {url}")
+                    return available_qualities
+                    
+        except Exception as e:
+            logger.warning(f"Error fetching qualities with strategy: {e}")
+            continue
+    
+    # If all methods fail, return common quality options  
+    # The download function will handle getting the closest available quality
+    logger.warning(f"Using default quality options for {url}")
+    return [
+        {"height": 1080, "label": "1080p HD"},
+        {"height": 720, "label": "720p HD"},
+        {"height": 480, "label": "480p"},
+        {"height": 360, "label": "360p"},
+    ]
+
+
+def get_video_quality_keyboard(video_id: str, qualities: list[dict]) -> InlineKeyboardMarkup:
+    """Create inline keyboard with available video quality options."""
+    keyboard = []
+    
+    for quality in qualities:
+        height = quality["height"]
+        label = quality["label"]
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📹 {label}", callback_data=f"quality:{video_id}:{height}"
+            )
+        ])
+    
+    # Add back button
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data=f"back_to_format:{video_id}")
+    ])
+    
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -87,9 +230,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{update.effective_user.id if update.effective_user else 'N/A'}"
     )
     await update.message.reply_text(
-        "Hi! I convert YouTube videos to audio files.\n\n"
-        "Simply paste a YouTube video link directly into the chat and "
-        "send it to me.",
+        "Hi! 🎬 I can download YouTube videos as **audio (MP3)** or **video** files.\n\n"
+        "Simply paste a YouTube video link and send it to me!",
+        parse_mode="Markdown",
         reply_markup=get_info_inline_keyboard(),  # Show the single button
     )
 
@@ -184,6 +327,123 @@ async def button_callback_handler(
                     text=instruction_text,
                     reply_markup=get_info_inline_keyboard(),
                 )
+        
+        # Handle audio download request
+        elif query.data.startswith("download_audio:"):
+            video_id = query.data.split(":")[1]
+            youtube_url = pending_video_urls.get(video_id)
+            
+            if not youtube_url:
+                await query.edit_message_text(
+                    "❌ Session expired. Please send the YouTube link again."
+                )
+                return
+            
+            chat_id = query.message.chat_id
+            logger.info(f"Audio download requested for video_id: {video_id}")
+            
+            # Process audio download
+            await process_audio_download(
+                chat_id, video_id, youtube_url, context, query
+            )
+            
+            # Clean up pending URL
+            pending_video_urls.pop(video_id, None)
+        
+        # Handle video download request - show quality selection
+        elif query.data.startswith("download_video:"):
+            video_id = query.data.split(":")[1]
+            youtube_url = pending_video_urls.get(video_id)
+            
+            if not youtube_url:
+                await query.edit_message_text(
+                    "❌ Session expired. Please send the YouTube link again."
+                )
+                return
+            
+            logger.info(f"Video download requested for video_id: {video_id}")
+            
+            # Show loading message while fetching qualities
+            await query.edit_message_text("🔍 Fetching available qualities...")
+            
+            # Get available qualities
+            qualities = await get_available_qualities(youtube_url)
+            
+            if qualities:
+                await query.edit_message_text(
+                    "📹 **Select Video Quality:**",
+                    parse_mode="Markdown",
+                    reply_markup=get_video_quality_keyboard(video_id, qualities),
+                )
+            else:
+                # Fallback to default qualities if fetch fails
+                default_qualities = [
+                    {"height": 720, "label": "720p HD"},
+                    {"height": 480, "label": "480p"},
+                    {"height": 360, "label": "360p"},
+                ]
+                await query.edit_message_text(
+                    "📹 **Select Video Quality:**\n_(Couldn't detect available qualities)_",
+                    parse_mode="Markdown",
+                    reply_markup=get_video_quality_keyboard(video_id, default_qualities),
+                )
+        
+        # Handle quality selection
+        elif query.data.startswith("quality:"):
+            parts = query.data.split(":")
+            video_id = parts[1]
+            height = int(parts[2])
+            youtube_url = pending_video_urls.get(video_id)
+            
+            if not youtube_url:
+                await query.edit_message_text(
+                    "❌ Session expired. Please send the YouTube link again."
+                )
+                return
+            
+            chat_id = query.message.chat_id
+            logger.info(f"Video download at {height}p requested for video_id: {video_id}")
+            
+            # Process video download
+            await process_video_download(
+                chat_id, video_id, youtube_url, height, context, query
+            )
+            
+            # Clean up pending URL
+            pending_video_urls.pop(video_id, None)
+        
+        # Handle back button
+        elif query.data.startswith("back_to_format:"):
+            video_id = query.data.split(":")[1]
+            
+            if video_id not in pending_video_urls:
+                await query.edit_message_text(
+                    "❌ Session expired. Please send the YouTube link again."
+                )
+                return
+            
+            await query.edit_message_text(
+                "🎬 **YouTube Link Detected!**\n\n"
+                "Choose download format:",
+                parse_mode="Markdown",
+                reply_markup=get_format_selection_keyboard(video_id),
+            )
+        
+        # Handle cancel button
+        elif query.data.startswith("cancel:"):
+            video_id = query.data.split(":")[1]
+            
+            # Clean up pending URL
+            pending_video_urls.pop(video_id, None)
+            
+            # Show the welcome/start menu
+            await query.edit_message_text(
+                "Hi! 🎬 I can download YouTube videos as **audio (MP3)** or **video** files.\n\n"
+                "Simply paste a YouTube video link and send it to me!",
+                parse_mode="Markdown",
+                reply_markup=get_info_inline_keyboard(),
+            )
+        
         else:
             logger.warning(f"Unknown callback_data received: '{query.data}'")
 
@@ -358,287 +618,19 @@ async def handle_message(
             f"Received YouTube URL: {youtube_url} from chat_id: {chat_id}"
         )
 
-        processing_message = None
-        # Try to send initial "Processing" message, but don't fail if it
-        # errors
-        try:
-            processing_message = await update.message.reply_text(
-                "Processing your request, please wait..."
-            )
-        except Exception as e_proc_msg:
-            logger.warning(
-                "Could not send initial 'Processing...' message: "
-                f"{e_proc_msg}"
-            )
+        # Store the URL for later use in callbacks
+        pending_video_urls[video_id] = youtube_url
+        
+        # Show format selection keyboard
+        await update.message.reply_text(
+            "🎬 **YouTube Link Detected!**\n\n"
+            "Choose download format:",
+            parse_mode="Markdown",
+            reply_markup=get_format_selection_keyboard(video_id),
+        )
+        return
 
-        audio_sent_successfully = False
-        # Initialize to ensure it's always defined for logging/cleanup
-        audio_file_path = None
-        file_size = 0  # Initialize file_size
-
-        try:
-            audio_file_path = await download_and_convert_youtube(
-                youtube_url, video_id
-            )
-            if audio_file_path:
-                file_size = os.path.getsize(audio_file_path)
-                logger.info(
-                    f"Audio file created: {audio_file_path}, Size: "
-                    f"{file_size} bytes"
-                )
-                TELEGRAM_AUDIO_LIMIT_BYTES = 50 * 1024 * 1024
-
-                if file_size > TELEGRAM_AUDIO_LIMIT_BYTES:
-                    logger.info(
-                        f"File size {file_size // (1024*1024)}MB > PTB limit. "
-                        "Attempting send with Pyrogram."
-                    )
-                    initial_pyro_message = (
-                        "Audio is large, preparing to send with an "
-                        "alternative method..."
-                    )
-                    if processing_message:
-                        try:
-                            await processing_message.edit_text(
-                                initial_pyro_message
-                            )
-                        except Exception as e_edit_proc:
-                            logger.warning(
-                                "Could not edit 'Processing...' for "
-                                f"Pyrogram: {e_edit_proc}"
-                            )
-                    # If the original processing_message failed, send a new
-                    # one
-                    elif update.message:
-                        try:
-                            processing_message = (
-                                await update.message.reply_text(
-                                    initial_pyro_message
-                                )
-                            )
-                        except Exception as e_new_proc:
-                            logger.warning(
-                                "Could not send new 'Processing...' message "
-                                f"for Pyrogram: {e_new_proc}"
-                            )
-
-                    pyrogram_sent = await send_audio_with_pyrogram(
-                        chat_id,
-                        audio_file_path,
-                        context.bot,
-                        processing_message,
-                        caption=f"Audio from: {youtube_url}",
-                    )
-
-                    if pyrogram_sent:
-                        audio_sent_successfully = True
-                        logger.info(
-                            "Pyrogram successfully sent large audio: "
-                            f"{audio_file_path}"
-                        )
-                        # Attempt to delete the progress message if it exists
-                        if processing_message:
-                            try:
-                                await processing_message.delete()
-                                logger.info(
-                                    "Deleted Pyrogram progress message."
-                                )
-                                # Clear message to prevent double cleanup
-                                processing_message = None
-                            except Exception as e_del_pyro_prog:
-                                logger.warning(
-                                    "Could not delete Pyrogram progress "
-                                    f"message: {e_del_pyro_prog}"
-                                )
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text="Large audio sent! What next?",
-                            reply_markup=get_info_inline_keyboard(),
-                        )
-                    else:
-                        logger.error(
-                            "Pyrogram failed to send large audio: "
-                            f"{audio_file_path}"
-                        )
-                        error_message = (
-                            "Failed to send the large audio file. It might "
-                            "be too large or a temporary issue occurred."
-                        )
-                        if processing_message:
-                            try:
-                                await processing_message.edit_text(
-                                    error_message
-                                )
-                            except Exception as e_edit_fail:
-                                logger.warning(
-                                    "Could not edit 'Processing...' on "
-                                    f"Pyrogram fail: {e_edit_fail}"
-                                )
-                        elif update.message:
-                            await update.message.reply_text(
-                                error_message,
-                                reply_markup=get_info_inline_keyboard(),
-                            )
-
-                else:
-                    logger.info(
-                        f"Sending audio via python-telegram-bot: "
-                        f"{audio_file_path} (size "
-                        f"{file_size // (1024*1024)}MB) to {chat_id}"
-                    )
-                    try:
-                        # Send with explicit filename and title
-                        # Get title without extension for display
-                        title_without_ext = os.path.splitext(os.path.basename(audio_file_path))[0]
-                        with open(audio_file_path, "rb") as audio_file_obj:
-                            await context.bot.send_audio(
-                                chat_id=chat_id,
-                                audio=audio_file_obj,
-                                filename=os.path.basename(audio_file_path),
-                                title=title_without_ext,
-                                read_timeout=180,
-                                write_timeout=180,
-                                connect_timeout=180,
-                            )
-                        audio_sent_successfully = True
-                        logger.info(
-                            f"Sent audio {audio_file_path} to {chat_id} "
-                            "via PTB"
-                        )
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text="Audio sent! What next?",
-                            reply_markup=get_info_inline_keyboard(),
-                        )
-                    except telegram.error.TimedOut as e_timeout:
-                        logger.warning(
-                            f"Timeout sending audio {audio_file_path} "
-                            f"(PTB): {e_timeout}. User might have it."
-                        )
-                        audio_sent_successfully = True
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text="Audio sent (timeout confirming). What next?",
-                            reply_markup=get_info_inline_keyboard(),
-                        )
-                    except httpx.ReadError as e_read:
-                        logger.error(
-                            f"httpx.ReadError sending audio "
-                            f"{audio_file_path} (PTB): {e_read}",
-                            exc_info=True,
-                        )
-                        if processing_message:
-                            try:
-                                await processing_message.edit_text(
-                                    "A network read error occurred while "
-                                    "sending (PTB). Please try again.\n"
-                                    f"Details: {e_read}"
-                                )
-                            except Exception as e_edit_read:
-                                logger.warning(
-                                    "Could not edit 'Processing...' on "
-                                    f"PTB ReadError: {e_edit_read}"
-                                )
-                        elif update.message:
-                            await update.message.reply_text(
-                                "A network read error occurred (PTB). "
-                                "Please try again.\n"
-                                f"Details: {e_read}",
-                                reply_markup=get_info_inline_keyboard(),
-                            )
-                    except Exception as e_send:
-                        logger.error(
-                            f"Failed to send audio {audio_file_path} (PTB): "
-                            f"{e_send}",
-                            exc_info=True,
-                        )
-                        if processing_message:
-                            try:
-                                await processing_message.edit_text(
-                                    f"Error sending audio (PTB): {e_send}"
-                                )
-                            except Exception as e_edit_send:
-                                logger.warning(
-                                    "Could not edit 'Processing...' on PTB "
-                                    f"send error: {e_edit_send}"
-                                )
-                        elif update.message:
-                            await update.message.reply_text(
-                                f"Error sending audio (PTB): {e_send}",
-                                reply_markup=get_info_inline_keyboard(),
-                            )
-
-                if audio_sent_successfully and processing_message:
-                    try:
-                        await processing_message.delete()
-                        logger.info("Deleted 'Processing...' msg.")
-                    except Exception as e_del:
-                        logger.warning(
-                            "Could not delete 'Processing...' msg: "
-                            f"{e_del} (it might have been edited or "
-                            "already deleted)"
-                        )
-
-            else:
-                logger.warning(
-                    "download_and_convert_youtube returned None for "
-                    f"{youtube_url}."
-                )
-                if processing_message:
-                    try:
-                        await processing_message.edit_text(
-                            "Couldn't process YouTube link. Check logs."
-                        )
-                    except Exception as e_edit_dlfail:
-                        logger.warning(
-                            "Could not edit 'Processing...' on DL fail: "
-                            f"{e_edit_dlfail}"
-                        )
-                elif update.message:
-                    await update.message.reply_text(
-                        "Couldn't process YouTube link. Please check the "
-                        "link or try again later.",
-                        reply_markup=get_info_inline_keyboard(),
-                    )
-
-        except Exception as e:
-            logger.error(
-                f"Generic error in handle_message for {youtube_url}: {e}",
-                exc_info=True,
-            )
-            if not audio_sent_successfully and processing_message:
-                try:
-                    await processing_message.edit_text(
-                        "An unexpected error occurred: {e}. Please check "
-                        "logs or try again."
-                    )
-                except Exception as e_edit_generic:
-                    logger.error(
-                        "Failed to edit 'Processing...' on generic error: "
-                        f"{e_edit_generic}"
-                    )
-            # If initial processing_message might have failed or doesn't
-            # exist
-            elif update.message:
-                await update.message.reply_text(
-                    f"An unexpected error occurred: {e}. Please try again "
-                    "later.",
-                    reply_markup=get_info_inline_keyboard(),
-                )
-
-        finally:  # Ensure cleanup happens
-            if audio_file_path and os.path.exists(audio_file_path):
-                try:
-                    os.remove(audio_file_path)
-                    logger.info(
-                        f"Removed temp file: {audio_file_path} in finally "
-                        "block."
-                    )
-                except OSError as e_rem_finally:
-                    logger.error(
-                        f"Error removing temp {audio_file_path} in finally "
-                        f"block: {e_rem_finally}"
-                    )
+    # Non-YouTube message handling
     else:
         logger.debug(
             f"Non-URL message from "
@@ -649,6 +641,282 @@ async def handle_message(
             "Please send a YouTube video link. Tap button for how-to.",
             reply_markup=get_info_inline_keyboard(),
         )
+
+
+async def process_audio_download(
+    chat_id: int,
+    video_id: str,
+    youtube_url: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+) -> None:
+    """Process audio download request from callback."""
+    processing_message = None
+    audio_file_path = None
+    audio_sent_successfully = False
+    
+    try:
+        # Edit the original message to show processing status
+        try:
+            await query.edit_message_text("⏳ Processing audio, please wait...")
+            processing_message = query.message
+        except Exception as e:
+            logger.warning(f"Could not edit message: {e}")
+        
+        audio_file_path = await download_and_convert_youtube(youtube_url, video_id)
+        
+        if audio_file_path:
+            file_size = os.path.getsize(audio_file_path)
+            logger.info(f"Audio file created: {audio_file_path}, Size: {file_size} bytes")
+            
+            TELEGRAM_AUDIO_LIMIT_BYTES = 50 * 1024 * 1024
+            
+            if file_size > TELEGRAM_AUDIO_LIMIT_BYTES:
+                logger.info(f"File size {file_size // (1024*1024)}MB > PTB limit. Using Pyrogram.")
+                
+                if processing_message:
+                    try:
+                        await processing_message.edit_text(
+                            "📤 Audio is large, uploading with alternative method..."
+                        )
+                    except Exception:
+                        pass
+                
+                pyrogram_sent = await send_audio_with_pyrogram(
+                    chat_id,
+                    audio_file_path,
+                    context.bot,
+                    processing_message,
+                    caption=f"🎵 Audio from YouTube",
+                )
+                
+                if pyrogram_sent:
+                    audio_sent_successfully = True
+                    if processing_message:
+                        try:
+                            await processing_message.delete()
+                        except Exception:
+                            pass
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Large audio sent! Send another link to download.",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ Failed to send large audio file.",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+            else:
+                # File is small enough for PTB
+                logger.info(f"Sending audio via PTB: {audio_file_path}")
+                try:
+                    title_without_ext = os.path.splitext(os.path.basename(audio_file_path))[0]
+                    with open(audio_file_path, "rb") as audio_file_obj:
+                        await context.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=audio_file_obj,
+                            filename=os.path.basename(audio_file_path),
+                            title=title_without_ext,
+                            read_timeout=180,
+                            write_timeout=180,
+                            connect_timeout=180,
+                        )
+                    audio_sent_successfully = True
+                    if processing_message:
+                        try:
+                            await processing_message.delete()
+                        except Exception:
+                            pass
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Audio sent! Send another link to download.",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+                except Exception as e_send:
+                    logger.error(f"Failed to send audio: {e_send}", exc_info=True)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ Error sending audio: {e_send}",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+        else:
+            logger.warning(f"download_and_convert_youtube returned None for {youtube_url}")
+            if processing_message:
+                try:
+                    await processing_message.edit_text(
+                        "❌ Couldn't process YouTube link. Try again later."
+                    )
+                except Exception:
+                    pass
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Couldn't process YouTube link. Try again later.",
+                    reply_markup=get_info_inline_keyboard(),
+                )
+    
+    except Exception as e:
+        logger.error(f"Error in process_audio_download: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ An error occurred: {e}",
+            reply_markup=get_info_inline_keyboard(),
+        )
+    
+    finally:
+        # Cleanup temp file
+        if audio_file_path and os.path.exists(audio_file_path):
+            try:
+                os.remove(audio_file_path)
+                logger.info(f"Removed temp file: {audio_file_path}")
+            except OSError as e:
+                logger.error(f"Error removing temp file: {e}")
+
+
+async def process_video_download(
+    chat_id: int,
+    video_id: str,
+    youtube_url: str,
+    height: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+) -> None:
+    """Process video download request at specified quality."""
+    processing_message = None
+    video_file_path = None
+    video_sent_successfully = False
+    
+    try:
+        # Edit the original message to show processing status
+        try:
+            await query.edit_message_text(f"⏳ Downloading video at {height}p, please wait...")
+            processing_message = query.message
+        except Exception as e:
+            logger.warning(f"Could not edit message: {e}")
+        
+        video_file_path = await download_youtube_video(youtube_url, video_id, height)
+        
+        if video_file_path:
+            file_size = os.path.getsize(video_file_path)
+            file_size_mb = file_size // (1024 * 1024)
+            logger.info(f"Video file created: {video_file_path}, Size: {file_size_mb}MB")
+            
+            # Telegram limit is 2GB for bots
+            TELEGRAM_VIDEO_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+            TELEGRAM_PTB_LIMIT_BYTES = 50 * 1024 * 1024
+            
+            if file_size > TELEGRAM_VIDEO_LIMIT_BYTES:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Video is too large ({file_size_mb}MB). Telegram limit is 2GB.",
+                    reply_markup=get_info_inline_keyboard(),
+                )
+                return
+            
+            if file_size > TELEGRAM_PTB_LIMIT_BYTES:
+                logger.info(f"Video size {file_size_mb}MB > 50MB. Using Pyrogram.")
+                
+                if processing_message:
+                    try:
+                        await processing_message.edit_text(
+                            f"📤 Uploading video ({file_size_mb}MB)..."
+                        )
+                    except Exception:
+                        pass
+                
+                pyrogram_sent = await send_video_with_pyrogram(
+                    chat_id,
+                    video_file_path,
+                    context.bot,
+                    processing_message,
+                    caption=f"🎬 {height}p video from YouTube",
+                )
+                
+                if pyrogram_sent:
+                    video_sent_successfully = True
+                    if processing_message:
+                        try:
+                            await processing_message.delete()
+                        except Exception:
+                            pass
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Video sent! Send another link to download.",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ Failed to send video file.",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+            else:
+                # File is small enough for PTB
+                logger.info(f"Sending video via PTB: {video_file_path}")
+                try:
+                    with open(video_file_path, "rb") as video_file_obj:
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=video_file_obj,
+                            filename=os.path.basename(video_file_path),
+                            caption=f"🎬 {height}p video",
+                            read_timeout=300,
+                            write_timeout=300,
+                            connect_timeout=180,
+                            supports_streaming=True,
+                        )
+                    video_sent_successfully = True
+                    if processing_message:
+                        try:
+                            await processing_message.delete()
+                        except Exception:
+                            pass
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Video sent! Send another link to download.",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+                except Exception as e_send:
+                    logger.error(f"Failed to send video: {e_send}", exc_info=True)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ Error sending video: {e_send}",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+        else:
+            logger.warning(f"download_youtube_video returned None for {youtube_url}")
+            if processing_message:
+                try:
+                    await processing_message.edit_text(
+                        "❌ Couldn't download video. Try a different quality or try again later."
+                    )
+                except Exception:
+                    pass
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Couldn't download video. Try again later.",
+                    reply_markup=get_info_inline_keyboard(),
+                )
+    
+    except Exception as e:
+        logger.error(f"Error in process_video_download: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ An error occurred: {e}",
+            reply_markup=get_info_inline_keyboard(),
+        )
+    
+    finally:
+        # Cleanup temp file
+        if video_file_path and os.path.exists(video_file_path):
+            try:
+                os.remove(video_file_path)
+                logger.info(f"Removed temp video file: {video_file_path}")
+            except OSError as e:
+                logger.error(f"Error removing temp video file: {e}")
 
 
 def sanitize_filename(title: str, max_length: int = 200) -> str:
@@ -889,6 +1157,150 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     # If we get here, all strategies failed
     logger.error(f"All download strategies failed for {url}")
     return None
+
+
+async def download_youtube_video(url: str, video_id: str, height: int) -> str | None:
+    """
+    Download a YouTube video at the specified quality.
+    
+    Downloads video and audio separately and merges them using FFmpeg.
+    """
+    base_output_template = f"{video_id}_video"
+    expected_final_path = None
+    
+    # Format string to get video at specific height + best audio
+    format_string = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    
+    ydl_opts = {
+        "outtmpl": base_output_template + ".%(ext)s",
+        "format": format_string,
+        "merge_output_format": "mp4",
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
+        "noplaylist": True,
+        "logger": logger,
+        "verbose": True,
+        "noprogress": True,
+        "ignoreerrors": False,
+        "progress_hooks": [ytdl_progress_hook],
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        },
+        "geo_bypass": True,
+    }
+    
+    # Try with browser cookies first, then fallback
+    strategies = [
+        {"cookiesfrombrowser": ("firefox",)},
+        {"extractor_args": {"youtube": {"player_client": ["android", "web"]}}},
+    ]
+    
+    for strategy in strategies:
+        try:
+            opts = ydl_opts.copy()
+            opts.update(strategy)
+            
+            logger.info(f"Downloading video at {height}p for: {url}")
+            
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    video_title = info.get('title', video_id)
+                    sanitized_title = sanitize_filename(video_title)
+                    
+                    # Find the downloaded file
+                    temp_file = f"{base_output_template}.mp4"
+                    expected_final_path = f"{sanitized_title}_{height}p.mp4"
+                    
+                    if os.path.exists(temp_file):
+                        try:
+                            os.rename(temp_file, expected_final_path)
+                            logger.info(f"Renamed to: {expected_final_path}")
+                        except OSError:
+                            expected_final_path = temp_file
+                    
+                    if expected_final_path and os.path.exists(expected_final_path):
+                        logger.info(f"Video download successful: {expected_final_path}")
+                        return expected_final_path
+                        
+        except yt_dlp.utils.DownloadError as e:
+            logger.warning(f"Video download strategy failed: {e}")
+            continue
+        except Exception as e:
+            logger.error(f"Error downloading video: {e}", exc_info=True)
+            continue
+    
+    logger.error(f"All video download strategies failed for {url}")
+    return None
+
+
+async def send_video_with_pyrogram(
+    chat_id: int,
+    file_path: str,
+    ptb_bot_instance,
+    processing_message_ptb,
+    caption: str | None = None,
+) -> bool:
+    """Send a video file using Pyrogram, suitable for larger files."""
+    if not API_ID or not API_HASH:
+        logger.error("Pyrogram API_ID or API_HASH not configured.")
+        return False
+
+    pyrogram_session_name = "pyrogram_bot_session_video"
+    
+    progress_args_tuple = None
+    if (
+        processing_message_ptb
+        and ptb_bot_instance
+        and hasattr(processing_message_ptb, "chat_id")
+        and hasattr(processing_message_ptb, "message_id")
+    ):
+        progress_args_tuple = (
+            processing_message_ptb.chat_id,
+            processing_message_ptb.message_id,
+            ptb_bot_instance,
+        )
+
+    try:
+        effective_api_id = int(API_ID)
+        
+        async with PyrogramClient(
+            name=pyrogram_session_name,
+            api_id=effective_api_id,
+            api_hash=API_HASH,
+            bot_token=TELEGRAM_BOT_TOKEN,
+            in_memory=True,
+        ) as app:
+            logger.info(f"Pyrogram sending video: {file_path} to {chat_id}")
+            await app.send_video(
+                chat_id=chat_id,
+                video=file_path,
+                caption=caption or "",
+                supports_streaming=True,
+                progress=pyrogram_upload_progress if progress_args_tuple else None,
+                progress_args=progress_args_tuple if progress_args_tuple else (),
+            )
+            logger.info(f"Pyrogram successfully sent video to {chat_id}")
+            if progress_args_tuple:
+                progress_message_last_edit_time.pop(
+                    (progress_args_tuple[0], progress_args_tuple[1]), None
+                )
+            return True
+            
+    except FloodWait as e_flood:
+        logger.error(f"Pyrogram FloodWait: Must wait {e_flood.value} seconds.")
+        return False
+    except Exception as e:
+        logger.error(f"Error sending video with Pyrogram: {e}", exc_info=True)
+        return False
 
 
 def main() -> None:
