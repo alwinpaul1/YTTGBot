@@ -585,6 +585,10 @@ async def pyrogram_upload_progress(
         (chat_id, message_id), 0
     )
 
+    if active_operations.get(chat_id, {}).get("cancelled", False):
+        logger.info(f"Cancellation detected during Pyrogram upload for chat_id {chat_id}")
+        raise Exception("Upload cancelled by user")
+
     if now - last_edit_time > 1.0:  # Edit at most once per second
         try:
             await ptb_bot_instance.edit_message_text(
