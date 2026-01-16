@@ -1218,52 +1218,39 @@ async def download_youtube_video(url: str, video_id: str, height: int) -> str | 
         "geo_bypass": True,
     }
     
-    # Try different strategies - default yt-dlp works best for high-quality formats
-    # iOS/TV clients require PO tokens which we don't have, so they fail
-    strategies = [
-        # Default yt-dlp - works for all formats including 4K
-        {},
-        # These are fallbacks if default fails (unlikely but possible)
-        {"extractor_args": {"youtube": {"player_client": ["web_safari"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
-    ]
+    # Use default yt-dlp - works for all formats including 4K
+    # No special player clients needed, they cause issues with authentication
     
-    for strategy in strategies:
-        try:
-            opts = ydl_opts.copy()
-            opts.update(strategy)
-            
-            logger.info(f"Downloading video at {height}p for: {url}")
-            
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if info:
-                    video_title = info.get('title', video_id)
-                    sanitized_title = sanitize_filename(video_title)
+    try:
+        logger.info(f"Downloading video at {height}p for: {url}")
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                video_title = info.get('title', video_id)
+                sanitized_title = sanitize_filename(video_title)
+                
+                # Find the downloaded file
+                temp_file = f"{base_output_template}.mp4"
+                expected_final_path = f"{sanitized_title}_{height}p.mp4"
+                
+                if os.path.exists(temp_file):
+                    try:
+                        os.rename(temp_file, expected_final_path)
+                        logger.info(f"Renamed to: {expected_final_path}")
+                    except OSError:
+                        expected_final_path = temp_file
+                
+                if expected_final_path and os.path.exists(expected_final_path):
+                    logger.info(f"Video download successful: {expected_final_path}")
+                    return expected_final_path
                     
-                    # Find the downloaded file
-                    temp_file = f"{base_output_template}.mp4"
-                    expected_final_path = f"{sanitized_title}_{height}p.mp4"
-                    
-                    if os.path.exists(temp_file):
-                        try:
-                            os.rename(temp_file, expected_final_path)
-                            logger.info(f"Renamed to: {expected_final_path}")
-                        except OSError:
-                            expected_final_path = temp_file
-                    
-                    if expected_final_path and os.path.exists(expected_final_path):
-                        logger.info(f"Video download successful: {expected_final_path}")
-                        return expected_final_path
-                        
-        except yt_dlp.utils.DownloadError as e:
-            logger.warning(f"Video download strategy failed: {e}")
-            continue
-        except Exception as e:
-            logger.error(f"Error downloading video: {e}", exc_info=True)
-            continue
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"Video download failed: {e}")
+    except Exception as e:
+        logger.error(f"Error downloading video: {e}", exc_info=True)
     
-    logger.error(f"All video download strategies failed for {url}")
+    logger.error(f"Video download failed for {url}")
     return None
 
 
