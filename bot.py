@@ -549,7 +549,7 @@ async def button_callback_handler(
                 )
             else:
                 logger.debug(f"Cancel failed. chat_id {cancel_chat_id} not in active_operations. Keys: {list(active_operations.keys())}")
-                await query.edit_message_text((
+                await query.edit_message_text(
                     "No active operation to cancel.",
                     reply_markup=get_info_inline_keyboard(),
                 )
