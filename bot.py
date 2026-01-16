@@ -1218,16 +1218,14 @@ async def download_youtube_video(url: str, video_id: str, height: int) -> str | 
         "geo_bypass": True,
     }
     
-    # Try different strategies - use player clients that work without authentication
+    # Try different strategies - default yt-dlp works best for high-quality formats
+    # iOS/TV clients require PO tokens which we don't have, so they fail
     strategies = [
-        # iOS client works without PO Token 
-        {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-        # TV client also works without authentication
-        {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
-        # Web safari as fallback
-        {"extractor_args": {"youtube": {"player_client": ["web_safari"]}}},
-        # Basic fallback with no specific client
+        # Default yt-dlp - works for all formats including 4K
         {},
+        # These are fallbacks if default fails (unlikely but possible)
+        {"extractor_args": {"youtube": {"player_client": ["web_safari"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
     ]
     
     for strategy in strategies:
