@@ -89,8 +89,8 @@ def get_format_selection_keyboard(video_id: str) -> InlineKeyboardMarkup:
 async def get_available_qualities(url: str) -> list[dict]:
     """
     Fetch available video qualities from YouTube.
-    Returns a list of dicts with height and label.
-    Uses player clients that don't require authentication.
+    Returns a list of dicts with format_id, height, and label.
+    Uses YouTube's format_note (like "1440p") for accurate labeling.
     """
     # Try different player clients that work without authentication
     ydl_opts_list = [
@@ -111,93 +111,128 @@ async def get_available_qualities(url: str) -> list[dict]:
             },
         },
         {
-            "quiet": True, 
+            "quiet": True,
             "no_warnings": True,
             "extract_flat": False,
         },
     ]
-    
+
     for ydl_opts in ydl_opts_list:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if not info:
                     continue
-                
+
                 formats = info.get("formats", [])
                 available_qualities = []
                 seen_labels = set()
-                
+
                 # Get all video formats with height info
                 video_formats = [
-                    f for f in formats 
+                    f for f in formats
                     if f.get("vcodec") != "none" and f.get("height")
                 ]
                 video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
-                
-                # Height ranges for widescreen videos (2.39:1 aspect ratio)
-                # Maps actual heights to standard quality labels
-                def get_quality_label(height):
-                    if height >= 1400:  # 1440p+ (actual 1074-1610)
-                        if height >= 2000 or height >= 1500:  # Very tall = 4K
-                            return (2160, "2160p 4K")
-                        return (1440, "1440p 2K")
-                    elif height >= 700:  # 720p-1080p (actual 536-806)
-                        if height >= 800:
-                            return (1080, "1080p HD")
-                        return (720, "720p HD")
-                    elif height >= 350:  # 480p (actual 358)
-                        return (480, "480p")
-                    elif height >= 250:  # 360p (actual 268)
-                        return (360, "360p")
-                    elif height >= 170:  # 240p (actual 178)
-                        return (240, "240p")
-                    else:  # 144p (actual 128)
-                        return (144, "144p")
-                
+
+                # Use YouTube's format_note for accurate quality labels
+                # YouTube provides format_note like "1440p", "1080p", "720p" etc.
+                # which correctly represents the intended quality regardless of
+                # actual pixel dimensions (which vary with aspect ratio)
                 for fmt in video_formats:
                     height = fmt.get("height")
+                    format_note = fmt.get("format_note", "")
+                    format_id = fmt.get("format_id", "")
+
                     if height:
-                        quality_height, label = get_quality_label(height)
+                        # Try to get the quality label from format_note first
+                        # Format notes like "1440p60 HDR", "1080p", "720p60" etc.
+                        label = None
+                        if format_note:
+                            # Extract the resolution part (e.g., "1440p" from "1440p60 HDR")
+                            import re
+                            match = re.match(r"(\d+)p", format_note)
+                            if match:
+                                quality_num = int(match.group(1))
+                                if quality_num >= 2160:
+                                    label = "2160p 4K"
+                                elif quality_num >= 1440:
+                                    label = "1440p 2K"
+                                elif quality_num >= 1080:
+                                    label = "1080p HD"
+                                elif quality_num >= 720:
+                                    label = "720p HD"
+                                elif quality_num >= 480:
+                                    label = "480p"
+                                elif quality_num >= 360:
+                                    label = "360p"
+                                elif quality_num >= 240:
+                                    label = "240p"
+                                else:
+                                    label = "144p"
+
+                        # Fallback to height-based labeling if format_note unavailable
+                        if not label:
+                            if height >= 2160:
+                                label = "2160p 4K"
+                            elif height >= 1440:
+                                label = "1440p 2K"
+                            elif height >= 1080:
+                                label = "1080p HD"
+                            elif height >= 720:
+                                label = "720p HD"
+                            elif height >= 480:
+                                label = "480p"
+                            elif height >= 360:
+                                label = "360p"
+                            elif height >= 240:
+                                label = "240p"
+                            else:
+                                label = "144p"
+
                         if label not in seen_labels:
                             seen_labels.add(label)
                             available_qualities.append({
-                                "height": height,  # Use actual detected height for precise download
+                                "format_id": format_id,  # Store format_id for precise selection
+                                "height": height,
                                 "label": label,
                             })
-                
+
                 # Sort by height descending
                 available_qualities.sort(key=lambda x: x["height"], reverse=True)
-                
+
                 if available_qualities:
                     logger.info(f"Found {len(available_qualities)} quality options for {url}")
+                    for q in available_qualities:
+                        logger.info(f"  - {q['label']} (height={q['height']}, format_id={q['format_id']})")
                     return available_qualities
-                    
+
         except Exception as e:
             logger.warning(f"Error fetching qualities with strategy: {e}")
             continue
-    
-    # If all methods fail, return common quality options  
+
+    # If all methods fail, return common quality options
     # The download function will handle getting the closest available quality
     logger.warning(f"Using default quality options for {url}")
     return [
-        {"height": 1080, "label": "1080p HD"},
-        {"height": 720, "label": "720p HD"},
-        {"height": 480, "label": "480p"},
-        {"height": 360, "label": "360p"},
+        {"format_id": "", "height": 1080, "label": "1080p HD"},
+        {"format_id": "", "height": 720, "label": "720p HD"},
+        {"format_id": "", "height": 480, "label": "480p"},
+        {"format_id": "", "height": 360, "label": "360p"},
     ]
 
 
 def get_video_quality_keyboard(video_id: str, qualities: list[dict]) -> InlineKeyboardMarkup:
     """Create inline keyboard with available video quality options."""
     keyboard = []
-    
+
     for quality in qualities:
-        height = quality["height"]
         label = quality["label"]
+        # Extract numeric quality from label (e.g., "1440" from "1440p 2K")
+        quality_num = label.split("p")[0]
         keyboard.append([
             InlineKeyboardButton(
-                f"📹 {label}", callback_data=f"quality:{video_id}:{height}"
+                f"📹 {label}", callback_data=f"quality:{video_id}:{quality_num}"
             )
         ])
     
@@ -235,31 +270,16 @@ class DownloadProgress:
             self.percent = 100
             self.filename = d.get("filename", "")
     
-    def get_progress_text(self, height: int) -> str:
+    def get_progress_text(self, quality: int) -> str:
         """Get formatted progress text for display."""
         if self.status == "starting":
-            return f"⏳ Starting download at {height}p..."
+            return f"Downloading {quality}p: 0%"
         elif self.status == "downloading":
-            downloaded_mb = self.downloaded_bytes / (1024 * 1024)
-            total_mb = self.total_bytes / (1024 * 1024) if self.total_bytes else 0
-            speed_mbps = self.speed / (1024 * 1024) if self.speed else 0
-            
-            if total_mb > 0:
-                return (
-                    f"⬇️ Downloading {height}p... {self.percent:.0f}%\n"
-                    f"📊 {downloaded_mb:.1f} MB / {total_mb:.1f} MB\n"
-                    f"🚀 {speed_mbps:.1f} MB/s"
-                )
-            else:
-                return (
-                    f"⬇️ Downloading {height}p...\n"
-                    f"📊 {downloaded_mb:.1f} MB downloaded\n"
-                    f"🚀 {speed_mbps:.1f} MB/s"
-                )
+            return f"Downloading {quality}p: {self.percent:.0f}%"
         elif self.status == "finished":
-            return f"✅ Download complete! Processing..."
+            return f"Processing {quality}p video..."
         else:
-            return f"⏳ Downloading video at {height}p..."
+            return f"Downloading {quality}p: 0%"
 
 
 # Progress hook for yt-dlp (logging only, used by audio download)
@@ -448,21 +468,21 @@ async def button_callback_handler(
         elif query.data.startswith("quality:"):
             parts = query.data.split(":")
             video_id = parts[1]
-            height = int(parts[2])
+            quality = int(parts[2])  # Quality designation (e.g., 1440, 1080), not pixel height
             youtube_url = pending_video_urls.get(video_id)
-            
+
             if not youtube_url:
                 await query.edit_message_text(
                     "❌ Session expired. Please send the YouTube link again."
                 )
                 return
-            
+
             chat_id = query.message.chat_id
-            logger.info(f"Video download at {height}p requested for video_id: {video_id}")
-            
+            logger.info(f"Video download at {quality}p requested for video_id: {video_id}")
+
             # Process video download
             await process_video_download(
-                chat_id, video_id, youtube_url, height, context, query
+                chat_id, video_id, youtube_url, quality, context, query
             )
             
             # Clean up pending URL
@@ -835,7 +855,7 @@ async def process_video_download(
     chat_id: int,
     video_id: str,
     youtube_url: str,
-    height: int,
+    quality: int,
     context: ContextTypes.DEFAULT_TYPE,
     query,
 ) -> None:
@@ -843,43 +863,43 @@ async def process_video_download(
     processing_message = None
     video_file_path = None
     video_sent_successfully = False
-    
+
     try:
         # Create local progress tracker for this download
         download_progress = DownloadProgress()
-        
+
         # Local progress hook that updates the tracker
         def progress_hook(d):
             download_progress.update(d)
-        
+
         # Edit the original message to show processing status
         try:
-            await query.edit_message_text(f"⏳ Starting download at {height}p...")
+            await query.edit_message_text(f"⏳ Starting download at {quality}p...")
             processing_message = query.message
         except Exception as e:
             logger.warning(f"Could not edit message: {e}")
-        
+
         # Run download in a thread executor while updating progress
         import concurrent.futures
         loop = asyncio.get_event_loop()
-        
+
         # Start download in background thread
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = loop.run_in_executor(
                 executor,
-                lambda: download_youtube_video(youtube_url, video_id, height, [progress_hook])
+                lambda: download_youtube_video(youtube_url, video_id, quality, [progress_hook])
             )
-            
+
             # Update progress message while downloading
             last_progress_text = ""
             last_update_time = 0
-            
+
             while not future.done():
                 await asyncio.sleep(1.5)  # Check every 1.5 seconds
-                
+
                 # Get current progress text from local tracker
-                progress_text = download_progress.get_progress_text(height)
-                
+                progress_text = download_progress.get_progress_text(quality)
+
                 # Only update if text changed and enough time has passed (rate limiting)
                 current_time = asyncio.get_event_loop().time()
                 if progress_text != last_progress_text and (current_time - last_update_time) > 2:
@@ -927,7 +947,7 @@ async def process_video_download(
                     video_file_path,
                     context.bot,
                     processing_message,
-                    caption=f"🎬 {height}p video from YouTube",
+                    caption=f"🎬 {quality}p video from YouTube",
                 )
                 
                 if pyrogram_sent:
@@ -957,7 +977,7 @@ async def process_video_download(
                             chat_id=chat_id,
                             video=video_file_obj,
                             filename=os.path.basename(video_file_path),
-                            caption=f"🎬 {height}p video",
+                            caption=f"🎬 {quality}p video",
                             read_timeout=300,
                             write_timeout=300,
                             connect_timeout=180,
@@ -1255,29 +1275,39 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     return None
 
 
-def download_youtube_video(url: str, video_id: str, height: int, progress_hooks: list = None) -> str | None:
+def download_youtube_video(url: str, video_id: str, quality: int, progress_hooks: list = None) -> str | None:
     """
     Download a YouTube video at the specified quality.
-    
+
+    Args:
+        url: YouTube video URL
+        video_id: Video ID for temp filename
+        quality: Quality designation (e.g., 1440, 1080, 720) - NOT actual pixel height
+        progress_hooks: Optional list of progress hook functions
+
     Downloads video and audio separately and merges them using FFmpeg.
+    Uses format_note filtering to get the correct quality regardless of aspect ratio.
     """
     base_output_template = f"{video_id}_video"
     expected_final_path = None
-    
-    base_output_template = f"{video_id}_video"
-    expected_final_path = None
-    
-    # Use precise height matching since we now pass the actual detected height
-    # We use a small tolerance range (+/- 2px) to be safe against minor reporting differences
-    min_h = height - 2
-    max_h = height + 2
-    
-    # Format string to get video within specific height range + best audio
-    format_string = f"bestvideo[height>={min_h}][height<={max_h}]+bestaudio/best[height>={min_h}][height<={max_h}]/best"
-    
+
     # Use provided hooks or empty list
     hooks = progress_hooks if progress_hooks else []
-    
+
+    # Use format_note matching to get correct quality
+    # YouTube's format_note contains the quality label (e.g., "1440p60", "1080p", "720p60 HDR")
+    # This correctly identifies the intended quality regardless of actual pixel dimensions
+    # which vary with aspect ratio (e.g., 2.39:1 ultrawide videos have lower pixel heights)
+    #
+    # Prefer best quality (HDR if available) at the requested resolution
+    format_string = (
+        # Best video at requested quality + best audio
+        f"bestvideo[format_note^={quality}p]+bestaudio/"
+        # Height-based fallback
+        f"bestvideo[height<={quality}]+bestaudio/"
+        f"best[height<={quality}]/best"
+    )
+
     ydl_opts = {
         "outtmpl": base_output_template + ".%(ext)s",
         "format": format_string,
@@ -1303,39 +1333,37 @@ def download_youtube_video(url: str, video_id: str, height: int, progress_hooks:
         },
         "geo_bypass": True,
     }
-    
-    # Use default yt-dlp - works for all formats including 4K
-    # No special player clients needed, they cause issues with authentication
-    
+
     try:
-        logger.info(f"Downloading video at {height}p for: {url}")
-        
+        logger.info(f"Downloading video at {quality}p for: {url}")
+        logger.info(f"Format string: {format_string}")
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info:
                 video_title = info.get('title', video_id)
                 sanitized_title = sanitize_filename(video_title)
-                
+
                 # Find the downloaded file
                 temp_file = f"{base_output_template}.mp4"
-                expected_final_path = f"{sanitized_title}_{height}p.mp4"
-                
+                expected_final_path = f"{sanitized_title}_{quality}p.mp4"
+
                 if os.path.exists(temp_file):
                     try:
                         os.rename(temp_file, expected_final_path)
                         logger.info(f"Renamed to: {expected_final_path}")
                     except OSError:
                         expected_final_path = temp_file
-                
+
                 if expected_final_path and os.path.exists(expected_final_path):
                     logger.info(f"Video download successful: {expected_final_path}")
                     return expected_final_path
-                    
+
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Video download failed: {e}")
     except Exception as e:
         logger.error(f"Error downloading video: {e}", exc_info=True)
-    
+
     logger.error(f"Video download failed for {url}")
     return None
 
