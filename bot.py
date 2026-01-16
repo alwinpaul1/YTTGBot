@@ -1,6 +1,7 @@
 """A Telegram bot to download YouTube videos as MP3 files."""
 
 import asyncio  # For rate limiting progress updates if needed
+import concurrent.futures
 import logging
 import os
 import re
@@ -208,7 +209,60 @@ def get_video_quality_keyboard(video_id: str, qualities: list[dict]) -> InlineKe
     return InlineKeyboardMarkup(keyboard)
 
 
-# Progress hook for yt-dlp
+# Download progress tracking
+class DownloadProgress:
+    """Track download progress for video downloads."""
+    def __init__(self):
+        self.downloaded_bytes = 0
+        self.total_bytes = 0
+        self.speed = 0
+        self.eta = 0
+        self.percent = 0
+        self.status = "starting"
+        self.filename = ""
+    
+    def update(self, d):
+        """Update progress from yt-dlp hook data."""
+        self.status = d.get("status", "unknown")
+        if self.status == "downloading":
+            self.downloaded_bytes = d.get("downloaded_bytes", 0)
+            self.total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            self.speed = d.get("speed", 0) or 0
+            self.eta = d.get("eta", 0) or 0
+            if self.total_bytes > 0:
+                self.percent = (self.downloaded_bytes / self.total_bytes) * 100
+        elif self.status == "finished":
+            self.percent = 100
+            self.filename = d.get("filename", "")
+    
+    def get_progress_text(self, height: int) -> str:
+        """Get formatted progress text for display."""
+        if self.status == "starting":
+            return f"⏳ Starting download at {height}p..."
+        elif self.status == "downloading":
+            downloaded_mb = self.downloaded_bytes / (1024 * 1024)
+            total_mb = self.total_bytes / (1024 * 1024) if self.total_bytes else 0
+            speed_mbps = self.speed / (1024 * 1024) if self.speed else 0
+            
+            if total_mb > 0:
+                return (
+                    f"⬇️ Downloading {height}p... {self.percent:.0f}%\n"
+                    f"📊 {downloaded_mb:.1f} MB / {total_mb:.1f} MB\n"
+                    f"🚀 {speed_mbps:.1f} MB/s"
+                )
+            else:
+                return (
+                    f"⬇️ Downloading {height}p...\n"
+                    f"📊 {downloaded_mb:.1f} MB downloaded\n"
+                    f"🚀 {speed_mbps:.1f} MB/s"
+                )
+        elif self.status == "finished":
+            return f"✅ Download complete! Processing..."
+        else:
+            return f"⏳ Downloading video at {height}p..."
+
+
+# Progress hook for yt-dlp (logging only, used by audio download)
 def ytdl_progress_hook(d):
     """Log the progress of the yt-dlp download."""
     if d["status"] == "finished":
@@ -223,9 +277,6 @@ def ytdl_progress_hook(d):
         )
     elif d["status"] == "error":
         logger.error(f"yt-dlp hook: Error. Data: {d}")
-    else:
-        # Simplified logging for other statuses
-        logger.debug(f"yt-dlp hook: status {d['status']}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -794,14 +845,54 @@ async def process_video_download(
     video_sent_successfully = False
     
     try:
+        # Create local progress tracker for this download
+        download_progress = DownloadProgress()
+        
+        # Local progress hook that updates the tracker
+        def progress_hook(d):
+            download_progress.update(d)
+        
         # Edit the original message to show processing status
         try:
-            await query.edit_message_text(f"⏳ Downloading video at {height}p, please wait...")
+            await query.edit_message_text(f"⏳ Starting download at {height}p...")
             processing_message = query.message
         except Exception as e:
             logger.warning(f"Could not edit message: {e}")
         
-        video_file_path = await download_youtube_video(youtube_url, video_id, height)
+        # Run download in a thread executor while updating progress
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        
+        # Start download in background thread
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = loop.run_in_executor(
+                executor,
+                lambda: download_youtube_video(youtube_url, video_id, height, [progress_hook])
+            )
+            
+            # Update progress message while downloading
+            last_progress_text = ""
+            last_update_time = 0
+            
+            while not future.done():
+                await asyncio.sleep(1.5)  # Check every 1.5 seconds
+                
+                # Get current progress text from local tracker
+                progress_text = download_progress.get_progress_text(height)
+                
+                # Only update if text changed and enough time has passed (rate limiting)
+                current_time = asyncio.get_event_loop().time()
+                if progress_text != last_progress_text and (current_time - last_update_time) > 2:
+                    if processing_message:
+                        try:
+                            await processing_message.edit_text(progress_text)
+                            last_progress_text = progress_text
+                            last_update_time = current_time
+                        except Exception as e:
+                            logger.debug(f"Could not update progress: {e}")
+            
+            # Get the result
+            video_file_path = future.result()
         
         if video_file_path:
             file_size = os.path.getsize(video_file_path)
@@ -1164,7 +1255,7 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     return None
 
 
-async def download_youtube_video(url: str, video_id: str, height: int) -> str | None:
+def download_youtube_video(url: str, video_id: str, height: int, progress_hooks: list = None) -> str | None:
     """
     Download a YouTube video at the specified quality.
     
@@ -1191,6 +1282,9 @@ async def download_youtube_video(url: str, video_id: str, height: int) -> str | 
     # Format string to get BEST video at or BELOW the selected quality + best audio
     format_string = f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
     
+    # Use provided hooks or empty list
+    hooks = progress_hooks if progress_hooks else []
+    
     ydl_opts = {
         "outtmpl": base_output_template + ".%(ext)s",
         "format": format_string,
@@ -1206,7 +1300,7 @@ async def download_youtube_video(url: str, video_id: str, height: int) -> str | 
         "verbose": True,
         "noprogress": True,
         "ignoreerrors": False,
-        "progress_hooks": [ytdl_progress_hook],
+        "progress_hooks": hooks,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
