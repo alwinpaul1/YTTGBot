@@ -1173,8 +1173,24 @@ async def download_youtube_video(url: str, video_id: str, height: int) -> str | 
     base_output_template = f"{video_id}_video"
     expected_final_path = None
     
-    # Format string to get video at specific height + best audio
-    format_string = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    # Map standard heights to actual height thresholds for widescreen videos
+    # The format selector uses actual pixel heights, not standard labels
+    height_map = {
+        2160: 1400,  # 4K videos have actual height ~1610
+        1440: 1000,  # 1440p videos have actual height ~1074
+        1080: 700,   # 1080p videos have actual height ~806
+        720: 500,    # 720p videos have actual height ~536
+        480: 320,    # 480p videos have actual height ~358
+        360: 220,    # 360p videos have actual height ~268
+        240: 150,    # 240p videos have actual height ~178
+        144: 100,    # 144p videos have actual height ~128
+    }
+    
+    actual_height = height_map.get(height, height)
+    
+    # Format string to get video at or above the actual height threshold + best audio
+    # Using 'bestvideo' with height filter to get the best quality at or above our threshold
+    format_string = f"bestvideo[height>={actual_height}]+bestaudio/bestvideo+bestaudio/best"
     
     ydl_opts = {
         "outtmpl": base_output_template + ".%(ext)s",
