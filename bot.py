@@ -5,6 +5,8 @@ import concurrent.futures
 import logging
 import os
 import re
+import time
+from pathlib import Path
 
 import httpx
 import telegram
@@ -43,16 +45,91 @@ YOUTUBE_URL_REGEX = (
     r"(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([\w\-]+)"
 )
 
+# --- Configuration Constants ---
+MAX_CONCURRENT_DOWNLOADS = 5  # Max simultaneous downloads
+PENDING_URL_EXPIRY_SECONDS = 30 * 60  # 30 minutes
+TEMP_FILE_MAX_AGE_SECONDS = 60 * 60  # 1 hour
+CLEANUP_INTERVAL_SECONDS = 10 * 60  # Run cleanup every 10 minutes
+TEMP_DIR = Path("temp_downloads")
+
+# --- Global State ---
+# Semaphore to limit concurrent downloads
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
 # This dictionary will store the last update time for each chat_id to
 # limit edits.
 progress_message_last_edit_time = {}
 
-# Store pending video URLs for quality selection (video_id -> url)
+# Store pending video URLs for quality selection
+# Structure: {video_id: {"url": str, "timestamp": float, "chat_id": int}}
 pending_video_urls = {}
 
-# Store active downloads/uploads that can be cancelled (chat_id -> cancel info)
-# Each entry contains: {"cancelled": bool, "file_path": str or None}
+# Store active downloads/uploads that can be cancelled
+# Key: (chat_id, video_id), Value: {"cancelled": bool, "file_path": str or None}
 active_operations = {}
+
+
+# --- Utility Functions for Cleanup ---
+def ensure_temp_dir() -> None:
+    """Create temp directory if it doesn't exist."""
+    TEMP_DIR.mkdir(exist_ok=True)
+    logger.info(f"Temp directory ensured: {TEMP_DIR.absolute()}")
+
+
+def cleanup_old_temp_files() -> int:
+    """Remove temp files older than TEMP_FILE_MAX_AGE_SECONDS. Returns count of removed files."""
+    if not TEMP_DIR.exists():
+        return 0
+    
+    removed_count = 0
+    current_time = time.time()
+    
+    for file_path in TEMP_DIR.iterdir():
+        if file_path.is_file():
+            file_age = current_time - file_path.stat().st_mtime
+            if file_age > TEMP_FILE_MAX_AGE_SECONDS:
+                try:
+                    file_path.unlink()
+                    logger.info(f"Cleaned up old temp file: {file_path.name} (age: {file_age/60:.1f} min)")
+                    removed_count += 1
+                except OSError as e:
+                    logger.warning(f"Failed to remove old temp file {file_path}: {e}")
+    
+    return removed_count
+
+
+def cleanup_expired_pending_urls() -> int:
+    """Remove pending URLs older than PENDING_URL_EXPIRY_SECONDS. Returns count of removed entries."""
+    current_time = time.time()
+    expired_keys = []
+    
+    for video_id, data in pending_video_urls.items():
+        if isinstance(data, dict) and "timestamp" in data:
+            age = current_time - data["timestamp"]
+            if age > PENDING_URL_EXPIRY_SECONDS:
+                expired_keys.append(video_id)
+    
+    for video_id in expired_keys:
+        pending_video_urls.pop(video_id, None)
+        logger.debug(f"Cleaned up expired pending URL for video_id: {video_id}")
+    
+    if expired_keys:
+        logger.info(f"Cleaned up {len(expired_keys)} expired pending URLs")
+    
+    return len(expired_keys)
+
+
+async def periodic_cleanup_task() -> None:
+    """Background task that periodically cleans up old files and expired URLs."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            files_removed = cleanup_old_temp_files()
+            urls_removed = cleanup_expired_pending_urls()
+            if files_removed or urls_removed:
+                logger.info(f"Periodic cleanup: {files_removed} files, {urls_removed} URLs removed")
+        except Exception as e:
+            logger.error(f"Error in periodic cleanup task: {e}")
 
 
 # --- Simplified Inline Keyboard ---
@@ -423,7 +500,8 @@ async def button_callback_handler(
         # Handle audio download request
         elif query.data.startswith("download_audio:"):
             video_id = query.data.split(":")[1]
-            youtube_url = pending_video_urls.get(video_id)
+            url_data = pending_video_urls.get(video_id)
+            youtube_url = url_data["url"] if url_data else None
             
             if not youtube_url:
                 await query.edit_message_text(
@@ -445,7 +523,8 @@ async def button_callback_handler(
         # Handle video download request - show quality selection
         elif query.data.startswith("download_video:"):
             video_id = query.data.split(":")[1]
-            youtube_url = pending_video_urls.get(video_id)
+            url_data = pending_video_urls.get(video_id)
+            youtube_url = url_data["url"] if url_data else None
             
             if not youtube_url:
                 await query.edit_message_text(
@@ -485,7 +564,8 @@ async def button_callback_handler(
             parts = query.data.split(":")
             video_id = parts[1]
             quality = int(parts[2])  # Quality designation (e.g., 1440, 1080), not pixel height
-            youtube_url = pending_video_urls.get(video_id)
+            url_data = pending_video_urls.get(video_id)
+            youtube_url = url_data["url"] if url_data else None
 
             if not youtube_url:
                 await query.edit_message_text(
@@ -742,8 +822,12 @@ async def handle_message(
             f"Received YouTube URL: {youtube_url} from chat_id: {chat_id}"
         )
 
-        # Store the URL for later use in callbacks
-        pending_video_urls[video_id] = youtube_url
+        # Store the URL for later use in callbacks (with timestamp for cleanup)
+        pending_video_urls[video_id] = {
+            "url": youtube_url,
+            "timestamp": time.time(),
+            "chat_id": chat_id
+        }
         
         # Show format selection keyboard
         await update.message.reply_text(
@@ -784,155 +868,180 @@ async def process_audio_download(
     active_operations[operation_key] = {"cancelled": False, "file_path": None}
 
     try:
-        # Edit the original message to show processing status with cancel button
-        try:
-            await query.edit_message_text(
-                "Processing audio...",
-                reply_markup=get_cancel_keyboard(chat_id, video_id)
-            )
-            processing_message = query.message
-        except Exception as e:
-            logger.warning(f"Could not edit message: {e}")
-
-        audio_file_path = await download_and_convert_youtube(youtube_url, video_id)
-
-        # Store file path for cleanup
-        if audio_file_path:
-            active_operations[operation_key]["file_path"] = audio_file_path
-
-        # Check if cancelled
-        if active_operations.get(operation_key, {}).get("cancelled", False):
-            if audio_file_path and os.path.exists(audio_file_path):
-                try:
-                    os.remove(audio_file_path)
-                    logger.info(f"Removed cancelled audio file: {audio_file_path}")
-                except OSError:
-                    pass
-            if processing_message:
-                try:
-                    await processing_message.edit_text(
-                        "❌ Download cancelled.",
-                        reply_markup=get_info_inline_keyboard()
-                    )
-                except Exception:
-                    pass
-            return
-
-        if audio_file_path:
-            file_size = os.path.getsize(audio_file_path)
-            logger.info(f"Audio file created: {audio_file_path}, Size: {file_size} bytes")
-
-            TELEGRAM_AUDIO_LIMIT_BYTES = 50 * 1024 * 1024
-
-            if file_size > TELEGRAM_AUDIO_LIMIT_BYTES:
-                logger.info(f"File size {file_size // (1024*1024)}MB > PTB limit. Using Pyrogram.")
-
+        # Check if we need to wait for a download slot
+        if download_semaphore.locked():
+            try:
+                await query.edit_message_text(
+                    "⏳ Waiting in queue... Your download will start shortly.",
+                    reply_markup=get_cancel_keyboard(chat_id, video_id)
+                )
+                processing_message = query.message
+            except Exception as e:
+                logger.warning(f"Could not show queue message: {e}")
+        
+        # Wait for download slot (semaphore)
+        async with download_semaphore:
+            # Check if cancelled while waiting in queue
+            if active_operations.get(operation_key, {}).get("cancelled", False):
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "Uploading audio: 0%",
-                            reply_markup=get_cancel_keyboard(chat_id, video_id)
+                            "❌ Download cancelled.",
+                            reply_markup=get_info_inline_keyboard()
                         )
                     except Exception:
                         pass
-
-                pyrogram_sent = await send_audio_with_pyrogram(
-                    chat_id,
-                    audio_file_path,
-                    context.bot,
-                    processing_message,
-                    video_id,
-                    caption=f"🎵 Audio from YouTube",
+                return
+            
+            # Edit the original message to show processing status with cancel button
+            try:
+                await query.edit_message_text(
+                    "Processing audio...",
+                    reply_markup=get_cancel_keyboard(chat_id, video_id)
                 )
+                processing_message = query.message
+            except Exception as e:
+                logger.warning(f"Could not edit message: {e}")
 
-                # Check if cancelled during upload
-                if active_operations.get(operation_key, {}).get("cancelled", False):
+            audio_file_path = await download_and_convert_youtube(youtube_url, video_id)
+
+            # Store file path for cleanup
+            if audio_file_path:
+                active_operations[operation_key]["file_path"] = audio_file_path
+
+            # Check if cancelled
+            if active_operations.get(operation_key, {}).get("cancelled", False):
+                if audio_file_path and os.path.exists(audio_file_path):
+                    try:
+                        os.remove(audio_file_path)
+                        logger.info(f"Removed cancelled audio file: {audio_file_path}")
+                    except OSError:
+                        pass
+                if processing_message:
+                    try:
+                        await processing_message.edit_text(
+                            "❌ Download cancelled.",
+                            reply_markup=get_info_inline_keyboard()
+                        )
+                    except Exception:
+                        pass
+                return
+
+            if audio_file_path:
+                file_size = os.path.getsize(audio_file_path)
+                logger.info(f"Audio file created: {audio_file_path}, Size: {file_size} bytes")
+
+                TELEGRAM_AUDIO_LIMIT_BYTES = 50 * 1024 * 1024
+
+                if file_size > TELEGRAM_AUDIO_LIMIT_BYTES:
+                    logger.info(f"File size {file_size // (1024*1024)}MB > PTB limit. Using Pyrogram.")
+
                     if processing_message:
                         try:
                             await processing_message.edit_text(
-                                "❌ Upload cancelled.",
-                                reply_markup=get_info_inline_keyboard()
+                                "Uploading audio: 0%",
+                                reply_markup=get_cancel_keyboard(chat_id, video_id)
                             )
                         except Exception:
                             pass
-                    return
 
-                if pyrogram_sent:
-                    audio_sent_successfully = True
+                    pyrogram_sent = await send_audio_with_pyrogram(
+                        chat_id,
+                        audio_file_path,
+                        context.bot,
+                        processing_message,
+                        video_id,
+                        caption=f"🎵 Audio from YouTube",
+                    )
+
+                    # Check if cancelled during upload
+                    if active_operations.get(operation_key, {}).get("cancelled", False):
+                        if processing_message:
+                            try:
+                                await processing_message.edit_text(
+                                    "❌ Upload cancelled.",
+                                    reply_markup=get_info_inline_keyboard()
+                                )
+                            except Exception:
+                                pass
+                        return
+
+                    if pyrogram_sent:
+                        audio_sent_successfully = True
+                        if processing_message:
+                            try:
+                                await processing_message.delete()
+                            except Exception:
+                                pass
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="✅ Large audio sent! Send another link to download.",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="❌ Failed to send large audio file.",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
+                else:
+                    # File is small enough for PTB
+                    logger.info(f"Sending audio via PTB: {audio_file_path}")
                     if processing_message:
                         try:
-                            await processing_message.delete()
+                            await processing_message.edit_text(
+                                "Uploading audio...",
+                                reply_markup=get_cancel_keyboard(chat_id, video_id)
+                            )
                         except Exception:
                             pass
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="✅ Large audio sent! Send another link to download.",
-                        reply_markup=get_info_inline_keyboard(),
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="❌ Failed to send large audio file.",
-                        reply_markup=get_info_inline_keyboard(),
-                    )
+
+                    try:
+                        title_without_ext = os.path.splitext(os.path.basename(audio_file_path))[0]
+                        with open(audio_file_path, "rb") as audio_file_obj:
+                            await context.bot.send_audio(
+                                chat_id=chat_id,
+                                audio=audio_file_obj,
+                                filename=os.path.basename(audio_file_path),
+                                title=title_without_ext,
+                                read_timeout=180,
+                                write_timeout=180,
+                                connect_timeout=180,
+                            )
+                        audio_sent_successfully = True
+                        if processing_message:
+                            try:
+                                await processing_message.delete()
+                            except Exception:
+                                pass
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="✅ Audio sent! Send another link to download.",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
+                    except Exception as e_send:
+                        logger.error(f"Failed to send audio: {e_send}", exc_info=True)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ Error sending audio: {e_send}",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
             else:
-                # File is small enough for PTB
-                logger.info(f"Sending audio via PTB: {audio_file_path}")
+                logger.warning(f"download_and_convert_youtube returned None for {youtube_url}")
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "Uploading audio...",
-                            reply_markup=get_cancel_keyboard(chat_id, video_id)
+                            "❌ Couldn't process YouTube link. Try again later.",
+                            reply_markup=get_info_inline_keyboard()
                         )
                     except Exception:
                         pass
-
-                try:
-                    title_without_ext = os.path.splitext(os.path.basename(audio_file_path))[0]
-                    with open(audio_file_path, "rb") as audio_file_obj:
-                        await context.bot.send_audio(
-                            chat_id=chat_id,
-                            audio=audio_file_obj,
-                            filename=os.path.basename(audio_file_path),
-                            title=title_without_ext,
-                            read_timeout=180,
-                            write_timeout=180,
-                            connect_timeout=180,
-                        )
-                    audio_sent_successfully = True
-                    if processing_message:
-                        try:
-                            await processing_message.delete()
-                        except Exception:
-                            pass
+                else:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="✅ Audio sent! Send another link to download.",
+                        text="❌ Couldn't process YouTube link. Try again later.",
                         reply_markup=get_info_inline_keyboard(),
                     )
-                except Exception as e_send:
-                    logger.error(f"Failed to send audio: {e_send}", exc_info=True)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ Error sending audio: {e_send}",
-                        reply_markup=get_info_inline_keyboard(),
-                    )
-        else:
-            logger.warning(f"download_and_convert_youtube returned None for {youtube_url}")
-            if processing_message:
-                try:
-                    await processing_message.edit_text(
-                        "❌ Couldn't process YouTube link. Try again later.",
-                        reply_markup=get_info_inline_keyboard()
-                    )
-                except Exception:
-                    pass
-            else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Couldn't process YouTube link. Try again later.",
-                    reply_markup=get_info_inline_keyboard(),
-                )
 
     except Exception as e:
         logger.error(f"Error in process_audio_download: {e}", exc_info=True)
@@ -973,66 +1082,21 @@ async def process_video_download(
     active_operations[operation_key] = {"cancelled": False, "file_path": None}
 
     try:
-        # Create local progress tracker for this download
-        download_progress = DownloadProgress()
-
-        # Local progress hook that updates the tracker
-        def progress_hook(d):
-            download_progress.update(d)
-
-        # Edit the original message to show processing status with cancel button
-        try:
-            await query.edit_message_text(
-                f"Downloading {quality}p: 0%",
-                reply_markup=get_cancel_keyboard(chat_id, video_id)
-            )
-            processing_message = query.message
-        except Exception as e:
-            logger.warning(f"Could not edit message: {e}")
-
-        # Run download in a thread executor while updating progress
-        loop = asyncio.get_event_loop()
-
-        # Start download in background thread
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = loop.run_in_executor(
-                executor,
-                lambda: download_youtube_video(youtube_url, video_id, quality, [progress_hook])
-            )
-
-            # Update progress message while downloading
-            last_progress_text = ""
-            last_update_time = 0
-
-            while not future.done():
-                await asyncio.sleep(1.5)  # Check every 1.5 seconds
-
-                # Check if cancelled
-                if active_operations.get(operation_key, {}).get("cancelled", False):
-                    logger.info(f"Download cancelled for chat_id: {chat_id}, video_id: {video_id}")
-                    # We can't stop the download thread, but we'll clean up after
-                    break
-
-                # Get current progress text from local tracker
-                progress_text = download_progress.get_progress_text(quality)
-
-                # Only update if text changed and enough time has passed (rate limiting)
-                current_time = asyncio.get_event_loop().time()
-                if progress_text != last_progress_text and (current_time - last_update_time) > 2:
-                    if processing_message:
-                        try:
-                            await processing_message.edit_text(
-                                progress_text,
-                                reply_markup=get_cancel_keyboard(chat_id, video_id)
-                            )
-                            last_progress_text = progress_text
-                            last_update_time = current_time
-                        except Exception as e:
-                            logger.debug(f"Could not update progress: {e}")
-
-            # Check if operation was cancelled
+        # Check if we need to wait for a download slot
+        if download_semaphore.locked():
+            try:
+                await query.edit_message_text(
+                    "⏳ Waiting in queue... Your download will start shortly.",
+                    reply_markup=get_cancel_keyboard(chat_id, video_id)
+                )
+                processing_message = query.message
+            except Exception as e:
+                logger.warning(f"Could not show queue message: {e}")
+        
+        # Wait for download slot (semaphore)
+        async with download_semaphore:
+            # Check if cancelled while waiting in queue
             if active_operations.get(operation_key, {}).get("cancelled", False):
-                # Don't wait for download to complete - show cancelled message immediately
                 if processing_message:
                     try:
                         await processing_message.edit_text(
@@ -1041,154 +1105,224 @@ async def process_video_download(
                         )
                     except Exception:
                         pass
-
-                # Clean up active operation
-                active_operations.pop(operation_key, None)
-
-                # Wait for download to finish in background then clean up file
-                try:
-                    video_file_path = await asyncio.wait_for(
-                        asyncio.wrap_future(future), timeout=60
-                    )
-                    if video_file_path and os.path.exists(video_file_path):
-                        os.remove(video_file_path)
-                        logger.info(f"Removed cancelled download file: {video_file_path}")
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"Could not clean up cancelled download: {e}")
                 return
 
-            # Get the result
-            video_file_path = future.result()
+            # Create local progress tracker for this download
+            download_progress = DownloadProgress()
 
-            # Store file path for cleanup (use .get() in case operation was cancelled)
-            if video_file_path and operation_key in active_operations:
-                active_operations[operation_key]["file_path"] = video_file_path
+            # Local progress hook that updates the tracker
+            def progress_hook(d):
+                download_progress.update(d)
 
-        if video_file_path:
-            file_size = os.path.getsize(video_file_path)
-            file_size_mb = file_size // (1024 * 1024)
-            logger.info(f"Video file created: {video_file_path}, Size: {file_size_mb}MB")
-            
-            # Telegram limit is 2GB for bots
-            TELEGRAM_VIDEO_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-            TELEGRAM_PTB_LIMIT_BYTES = 50 * 1024 * 1024
-            
-            if file_size > TELEGRAM_VIDEO_LIMIT_BYTES:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ Video is too large ({file_size_mb}MB). Telegram limit is 2GB.",
-                    reply_markup=get_info_inline_keyboard(),
+            # Edit the original message to show processing status with cancel button
+            try:
+                await query.edit_message_text(
+                    f"Downloading {quality}p: 0%",
+                    reply_markup=get_cancel_keyboard(chat_id, video_id)
                 )
-                return
-            
-            if file_size > TELEGRAM_PTB_LIMIT_BYTES:
-                logger.info(f"Video size {file_size_mb}MB > 50MB. Using Pyrogram.")
+                processing_message = query.message
+            except Exception as e:
+                logger.warning(f"Could not edit message: {e}")
 
-                if processing_message:
-                    try:
-                        await processing_message.edit_text(
-                            f"Uploading video: 0%",
-                            reply_markup=get_cancel_keyboard(chat_id, video_id)
-                        )
-                    except Exception:
-                        pass
+            # Run download in a thread executor while updating progress
+            loop = asyncio.get_event_loop()
 
-                pyrogram_sent = await send_video_with_pyrogram(
-                    chat_id,
-                    video_file_path,
-                    context.bot,
-                    processing_message,
-                    video_id,
-                    caption=f"🎬 {quality}p video from YouTube",
+            # Start download in background thread
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = loop.run_in_executor(
+                    executor,
+                    lambda: download_youtube_video(youtube_url, video_id, quality, [progress_hook])
                 )
 
-                # Check if cancelled during upload
+                # Update progress message while downloading
+                last_progress_text = ""
+                last_update_time = 0
+
+                while not future.done():
+                    await asyncio.sleep(1.5)  # Check every 1.5 seconds
+
+                    # Check if cancelled
+                    if active_operations.get(operation_key, {}).get("cancelled", False):
+                        logger.info(f"Download cancelled for chat_id: {chat_id}, video_id: {video_id}")
+                        # We can't stop the download thread, but we'll clean up after
+                        break
+
+                    # Get current progress text from local tracker
+                    progress_text = download_progress.get_progress_text(quality)
+
+                    # Only update if text changed and enough time has passed (rate limiting)
+                    current_time = asyncio.get_event_loop().time()
+                    if progress_text != last_progress_text and (current_time - last_update_time) > 2:
+                        if processing_message:
+                            try:
+                                await processing_message.edit_text(
+                                    progress_text,
+                                    reply_markup=get_cancel_keyboard(chat_id, video_id)
+                                )
+                                last_progress_text = progress_text
+                                last_update_time = current_time
+                            except Exception as e:
+                                logger.debug(f"Could not update progress: {e}")
+
+                # Check if operation was cancelled
                 if active_operations.get(operation_key, {}).get("cancelled", False):
+                    # Don't wait for download to complete - show cancelled message immediately
                     if processing_message:
                         try:
                             await processing_message.edit_text(
-                                "❌ Upload cancelled.",
+                                "❌ Download cancelled.",
                                 reply_markup=get_info_inline_keyboard()
                             )
                         except Exception:
                             pass
+
+                    # Clean up active operation
+                    active_operations.pop(operation_key, None)
+
+                    # Wait for download to finish in background then clean up file
+                    try:
+                        video_file_path = await asyncio.wait_for(
+                            asyncio.wrap_future(future), timeout=60
+                        )
+                        if video_file_path and os.path.exists(video_file_path):
+                            os.remove(video_file_path)
+                            logger.info(f"Removed cancelled download file: {video_file_path}")
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning(f"Could not clean up cancelled download: {e}")
                     return
 
-                if pyrogram_sent:
-                    video_sent_successfully = True
+                # Get the result
+                video_file_path = future.result()
+
+                # Store file path for cleanup (use .get() in case operation was cancelled)
+                if video_file_path and operation_key in active_operations:
+                    active_operations[operation_key]["file_path"] = video_file_path
+
+            if video_file_path:
+                file_size = os.path.getsize(video_file_path)
+                file_size_mb = file_size // (1024 * 1024)
+                logger.info(f"Video file created: {video_file_path}, Size: {file_size_mb}MB")
+                
+                # Telegram limit is 2GB for bots
+                TELEGRAM_VIDEO_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+                TELEGRAM_PTB_LIMIT_BYTES = 50 * 1024 * 1024
+                
+                if file_size > TELEGRAM_VIDEO_LIMIT_BYTES:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ Video is too large ({file_size_mb}MB). Telegram limit is 2GB.",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+                    return
+                
+                if file_size > TELEGRAM_PTB_LIMIT_BYTES:
+                    logger.info(f"Video size {file_size_mb}MB > 50MB. Using Pyrogram.")
+
                     if processing_message:
                         try:
-                            await processing_message.delete()
+                            await processing_message.edit_text(
+                                f"Uploading video: 0%",
+                                reply_markup=get_cancel_keyboard(chat_id, video_id)
+                            )
                         except Exception:
                             pass
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="✅ Video sent! Send another link to download.",
-                        reply_markup=get_info_inline_keyboard(),
+
+                    pyrogram_sent = await send_video_with_pyrogram(
+                        chat_id,
+                        video_file_path,
+                        context.bot,
+                        processing_message,
+                        video_id,
+                        caption=f"🎬 {quality}p video from YouTube",
                     )
+
+                    # Check if cancelled during upload
+                    if active_operations.get(operation_key, {}).get("cancelled", False):
+                        if processing_message:
+                            try:
+                                await processing_message.edit_text(
+                                    "❌ Upload cancelled.",
+                                    reply_markup=get_info_inline_keyboard()
+                                )
+                            except Exception:
+                                pass
+                        return
+
+                    if pyrogram_sent:
+                        video_sent_successfully = True
+                        if processing_message:
+                            try:
+                                await processing_message.delete()
+                            except Exception:
+                                pass
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="✅ Video sent! Send another link to download.",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="❌ Failed to send video file.",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
                 else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="❌ Failed to send video file.",
-                        reply_markup=get_info_inline_keyboard(),
-                    )
+                    # File is small enough for PTB
+                    logger.info(f"Sending video via PTB: {video_file_path}")
+                    if processing_message:
+                        try:
+                            await processing_message.edit_text(
+                                "Uploading video...",
+                                reply_markup=get_cancel_keyboard(chat_id, video_id)
+                            )
+                        except Exception:
+                            pass
+
+                    try:
+                        with open(video_file_path, "rb") as video_file_obj:
+                            await context.bot.send_video(
+                                chat_id=chat_id,
+                                video=video_file_obj,
+                                filename=os.path.basename(video_file_path),
+                                caption=f"🎬 {quality}p video",
+                                read_timeout=300,
+                                write_timeout=300,
+                                connect_timeout=180,
+                                supports_streaming=True,
+                            )
+                        video_sent_successfully = True
+                        if processing_message:
+                            try:
+                                await processing_message.delete()
+                            except Exception:
+                                pass
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="✅ Video sent! Send another link to download.",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
+                    except Exception as e_send:
+                        logger.error(f"Failed to send video: {e_send}", exc_info=True)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ Error sending video: {e_send}",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
             else:
-                # File is small enough for PTB
-                logger.info(f"Sending video via PTB: {video_file_path}")
+                logger.warning(f"download_youtube_video returned None for {youtube_url}")
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            "Uploading video...",
-                            reply_markup=get_cancel_keyboard(chat_id, video_id)
+                            "❌ Couldn't download video. Try a different quality or try again later."
                         )
                     except Exception:
                         pass
-
-                try:
-                    with open(video_file_path, "rb") as video_file_obj:
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            video=video_file_obj,
-                            filename=os.path.basename(video_file_path),
-                            caption=f"🎬 {quality}p video",
-                            read_timeout=300,
-                            write_timeout=300,
-                            connect_timeout=180,
-                            supports_streaming=True,
-                        )
-                    video_sent_successfully = True
-                    if processing_message:
-                        try:
-                            await processing_message.delete()
-                        except Exception:
-                            pass
+                else:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="✅ Video sent! Send another link to download.",
+                        text="❌ Couldn't download video. Try again later.",
                         reply_markup=get_info_inline_keyboard(),
                     )
-                except Exception as e_send:
-                    logger.error(f"Failed to send video: {e_send}", exc_info=True)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ Error sending video: {e_send}",
-                        reply_markup=get_info_inline_keyboard(),
-                    )
-        else:
-            logger.warning(f"download_youtube_video returned None for {youtube_url}")
-            if processing_message:
-                try:
-                    await processing_message.edit_text(
-                        "❌ Couldn't download video. Try a different quality or try again later."
-                    )
-                except Exception:
-                    pass
-            else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Couldn't download video. Try again later.",
-                    reply_markup=get_info_inline_keyboard(),
-                )
     
     except Exception as e:
         logger.error(f"Error in process_video_download: {e}", exc_info=True)
@@ -1242,8 +1376,8 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     FFmpeg to convert it into an MP3 audio file. It tries multiple
     strategies to ensure the download is successful.
     """
-    # Download with video_id first, then rename to title
-    base_output_template = f"{video_id}"
+    # Download to temp directory with video_id first, then rename to title
+    base_output_template = str(TEMP_DIR / video_id)
     temp_final_path = f"{base_output_template}.mp3"
     expected_final_path = None
 
@@ -1335,7 +1469,7 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
                 if info:
                     video_title = info.get('title', video_id)
                     sanitized_title = sanitize_filename(video_title)
-                    expected_final_path = f"{sanitized_title}.mp3"
+                    expected_final_path = str(TEMP_DIR / f"{sanitized_title}.mp3")
 
             logger.info(
                 f"yt-dlp download & FFmpeg conversion for {url} completed "
@@ -1464,7 +1598,7 @@ def download_youtube_video(url: str, video_id: str, quality: int, progress_hooks
     Downloads video and audio separately and merges them using FFmpeg.
     Uses format_note filtering to get the correct quality regardless of aspect ratio.
     """
-    base_output_template = f"{video_id}_video"
+    base_output_template = str(TEMP_DIR / f"{video_id}_video")
     expected_final_path = None
 
     # Use provided hooks or empty list
@@ -1522,7 +1656,7 @@ def download_youtube_video(url: str, video_id: str, quality: int, progress_hooks
 
                 # Find the downloaded file
                 temp_file = f"{base_output_template}.mp4"
-                expected_final_path = f"{sanitized_title}_{quality}p.mp4"
+                expected_final_path = str(TEMP_DIR / f"{sanitized_title}_{quality}p.mp4")
 
                 if os.path.exists(temp_file):
                     try:
@@ -1621,6 +1755,12 @@ def main() -> None:
         )
         # Allow bot to start, but Pyrogram part will be disabled.
 
+    # Initialize temp directory and run startup cleanup
+    ensure_temp_dir()
+    startup_files_removed = cleanup_old_temp_files()
+    startup_urls_removed = cleanup_expired_pending_urls()
+    logger.info(f"Startup cleanup: {startup_files_removed} old files, {startup_urls_removed} expired URLs removed")
+
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -1636,6 +1776,13 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
     application.add_handler(CallbackQueryHandler(button_callback_handler))
+
+    # Start periodic cleanup task
+    async def post_init(app):
+        asyncio.create_task(periodic_cleanup_task())
+        logger.info("Started periodic cleanup task")
+    
+    application.post_init = post_init
 
     logger.info(
         "Starting bot with Pyrogram integration for large files & DEBUG "
