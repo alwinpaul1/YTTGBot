@@ -903,7 +903,31 @@ async def process_audio_download(
             except Exception as e:
                 logger.warning(f"Could not edit message: {e}")
 
-            audio_file_path = await download_and_convert_youtube(youtube_url, video_id)
+            try:
+                audio_file_path = await download_and_convert_youtube(youtube_url, video_id)
+            except YouTubeError as yt_err:
+                # Show the YouTube error directly to the user
+                error_message = str(yt_err)
+                logger.info(f"Showing YouTube error to user: {error_message}")
+                if processing_message:
+                    try:
+                        await processing_message.edit_text(
+                            f"❌ {error_message}",
+                            reply_markup=get_info_inline_keyboard()
+                        )
+                    except Exception:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ {error_message}",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ {error_message}",
+                        reply_markup=get_info_inline_keyboard(),
+                    )
+                return
 
             # Store file path for cleanup
             if audio_file_path:
@@ -1192,7 +1216,31 @@ async def process_video_download(
                     return
 
                 # Get the result
-                video_file_path = future.result()
+                try:
+                    video_file_path = future.result()
+                except YouTubeError as yt_err:
+                    # Show the YouTube error directly to the user
+                    error_message = str(yt_err)
+                    logger.info(f"Showing YouTube error to user: {error_message}")
+                    if processing_message:
+                        try:
+                            await processing_message.edit_text(
+                                f"❌ {error_message}",
+                                reply_markup=get_info_inline_keyboard()
+                            )
+                        except Exception:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"❌ {error_message}",
+                                reply_markup=get_info_inline_keyboard(),
+                            )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ {error_message}",
+                            reply_markup=get_info_inline_keyboard(),
+                        )
+                    return
 
                 # Store file path for cleanup (use .get() in case operation was cancelled)
                 if video_file_path and operation_key in active_operations:
@@ -1368,6 +1416,11 @@ def sanitize_filename(title: str, max_length: int = 200) -> str:
     return sanitized
 
 
+class YouTubeError(Exception):
+    """Custom exception for YouTube-specific errors that should be shown to users."""
+    pass
+
+
 async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     """
     Download a YouTube video and convert it to an MP3 file.
@@ -1375,6 +1428,9 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
     This function uses yt-dlp to download a video from a given URL and
     FFmpeg to convert it into an MP3 audio file. It tries multiple
     strategies to ensure the download is successful.
+
+    Raises:
+        YouTubeError: When YouTube returns a user-facing error (geo-restriction, etc.)
     """
     # Download to temp directory with video_id first, then rename to title
     base_output_template = str(TEMP_DIR / video_id)
@@ -1526,6 +1582,14 @@ async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
                 f"for {url}: {e}"
             )
 
+            # Check if this is a YouTube error that should be shown to user
+            # These are errors from YouTube itself, not technical/retry-able errors
+            if "ERROR: [youtube]" in error_msg:
+                logger.info(f"YouTube error detected, showing to user: {error_msg}")
+                if expected_final_path and os.path.exists(expected_final_path):
+                    os.remove(expected_final_path)
+                raise YouTubeError(error_msg)
+
             # Check for specific error types and decide whether to continue
             if i < len(download_strategies) - 1:  # Not the last strategy
                 if (
@@ -1670,7 +1734,11 @@ def download_youtube_video(url: str, video_id: str, quality: int, progress_hooks
                     return expected_final_path
 
     except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
         logger.error(f"Video download failed: {e}")
+        # Check if this is a YouTube error that should be shown to user
+        if "ERROR: [youtube]" in error_msg:
+            raise YouTubeError(error_msg)
     except Exception as e:
         logger.error(f"Error downloading video: {e}", exc_info=True)
 
