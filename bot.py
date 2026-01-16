@@ -433,14 +433,14 @@ async def button_callback_handler(
             
             chat_id = query.message.chat_id
             logger.info(f"Audio download requested for video_id: {video_id}")
-            
-            # Process audio download
-            await process_audio_download(
-                chat_id, video_id, youtube_url, context, query
-            )
-            
-            # Clean up pending URL
+
+            # Clean up pending URL first
             pending_video_urls.pop(video_id, None)
+
+            # Process audio download as a background task so cancel button can work
+            asyncio.create_task(process_audio_download(
+                chat_id, video_id, youtube_url, context, query
+            ))
         
         # Handle video download request - show quality selection
         elif query.data.startswith("download_video:"):
@@ -496,13 +496,13 @@ async def button_callback_handler(
             chat_id = query.message.chat_id
             logger.info(f"Video download at {quality}p requested for video_id: {video_id}")
 
-            # Process video download
-            await process_video_download(
-                chat_id, video_id, youtube_url, quality, context, query
-            )
-            
-            # Clean up pending URL
+            # Clean up pending URL first
             pending_video_urls.pop(video_id, None)
+
+            # Process video download as a background task so cancel button can work
+            asyncio.create_task(process_video_download(
+                chat_id, video_id, youtube_url, quality, context, query
+            ))
         
         # Handle back button
         elif query.data.startswith("back_to_format:"):
@@ -548,7 +548,8 @@ async def button_callback_handler(
                     "❌ Cancelling... Please wait.",
                 )
             else:
-                await query.edit_message_text(
+                logger.debug(f"Cancel failed. chat_id {cancel_chat_id} not in active_operations. Keys: {list(active_operations.keys())}")
+                await query.edit_message_text((
                     "No active operation to cancel.",
                     reply_markup=get_info_inline_keyboard(),
                 )
@@ -767,6 +768,7 @@ async def process_audio_download(
 
     # Register this operation as active (for cancellation support)
     active_operations[chat_id] = {"cancelled": False, "file_path": None}
+    logger.debug(f"Registered active operation for chat_id {chat_id}. Keys: {list(active_operations.keys())}")
 
     try:
         # Edit the original message to show processing status with cancel button
@@ -928,7 +930,8 @@ async def process_audio_download(
 
     finally:
         # Clean up active operation
-        active_operations.pop(chat_id, None)
+        removed = active_operations.pop(chat_id, None)
+        logger.debug(f"Removing active operation for chat_id {chat_id} in process_audio_download finally. Removed: {removed}")
 
         # Cleanup temp file
         if audio_file_path and os.path.exists(audio_file_path):
@@ -1013,35 +1016,39 @@ async def process_video_download(
                         except Exception as e:
                             logger.debug(f"Could not update progress: {e}")
 
-            # Get the result (wait for download to complete even if cancelled)
+            # Check if operation was cancelled
+            if active_operations.get(chat_id, {}).get("cancelled", False):
+                # Don't wait for download to complete - show cancelled message immediately
+                if processing_message:
+                    try:
+                        await processing_message.edit_text(
+                            "❌ Download cancelled.",
+                            reply_markup=get_info_inline_keyboard()
+                        )
+                    except Exception:
+                        pass
+
+                # Clean up active operation
+                active_operations.pop(chat_id, None)
+
+                # Wait for download to finish in background then clean up file
+                try:
+                    video_file_path = await asyncio.wait_for(
+                        asyncio.wrap_future(future), timeout=60
+                    )
+                    if video_file_path and os.path.exists(video_file_path):
+                        os.remove(video_file_path)
+                        logger.info(f"Removed cancelled download file: {video_file_path}")
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Could not clean up cancelled download: {e}")
+                return
+
+            # Get the result
             video_file_path = future.result()
 
-            # Store file path for cleanup
-            if video_file_path:
+            # Store file path for cleanup (use .get() in case operation was cancelled)
+            if video_file_path and chat_id in active_operations:
                 active_operations[chat_id]["file_path"] = video_file_path
-
-        # Check if operation was cancelled
-        if active_operations.get(chat_id, {}).get("cancelled", False):
-            # Clean up the downloaded file
-            if video_file_path and os.path.exists(video_file_path):
-                try:
-                    os.remove(video_file_path)
-                    logger.info(f"Removed cancelled download file: {video_file_path}")
-                except OSError as e:
-                    logger.error(f"Error removing cancelled file: {e}")
-
-            if processing_message:
-                try:
-                    await processing_message.edit_text(
-                        "❌ Download cancelled.",
-                        reply_markup=get_info_inline_keyboard()
-                    )
-                except Exception:
-                    pass
-
-            # Clean up active operation
-            active_operations.pop(chat_id, None)
-            return
 
         if video_file_path:
             file_size = os.path.getsize(video_file_path)
@@ -1178,7 +1185,8 @@ async def process_video_download(
     
     finally:
         # Clean up active operation
-        active_operations.pop(chat_id, None)
+        removed = active_operations.pop(chat_id, None)
+        logger.debug(f"Removing active operation for chat_id {chat_id} in process_video_download finally. Removed: {removed}")
 
         # Cleanup temp file
         if video_file_path and os.path.exists(video_file_path):
