@@ -90,12 +90,12 @@ def get_format_selection_keyboard(video_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_cancel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+def get_cancel_keyboard(chat_id: int, video_id: str) -> InlineKeyboardMarkup:
     """Return inline keyboard with cancel button for ongoing operations."""
     keyboard = [
         [
             InlineKeyboardButton(
-                "❌ Cancel", callback_data=f"cancel_operation:{chat_id}"
+                "❌ Cancel", callback_data=f"cancel_operation:{chat_id}:{video_id}"
             )
         ]
     ]
@@ -538,11 +538,16 @@ async def button_callback_handler(
 
         # Handle cancel operation (for ongoing downloads/uploads)
         elif query.data.startswith("cancel_operation:"):
-            cancel_chat_id = int(query.data.split(":")[1])
+            parts = query.data.split(":")
+            cancel_chat_id = int(parts[1])
+            cancel_video_id = parts[2] if len(parts) > 2 else None
+            
+            # Use composite key (chat_id, video_id)
+            operation_key = (cancel_chat_id, cancel_video_id)
 
-            if cancel_chat_id in active_operations:
-                active_operations[cancel_chat_id]["cancelled"] = True
-                logger.info(f"Cancel requested for chat_id: {cancel_chat_id}")
+            if operation_key in active_operations:
+                active_operations[operation_key]["cancelled"] = True
+                logger.info(f"Cancel requested for chat_id: {cancel_chat_id}, video_id: {cancel_video_id}")
 
                 await query.edit_message_text(
                     "❌ Cancelling... Please wait.",
@@ -576,7 +581,7 @@ async def button_callback_handler(
 
 
 async def pyrogram_upload_progress(
-    current, total, chat_id, message_id, ptb_bot_instance
+    current, total, chat_id, message_id, ptb_bot_instance, video_id
 ):
     """Pyrogram progress callback to update upload status."""
     percentage = int((current / total) * 100)
@@ -585,8 +590,10 @@ async def pyrogram_upload_progress(
         (chat_id, message_id), 0
     )
 
-    if active_operations.get(chat_id, {}).get("cancelled", False):
-        logger.info(f"Cancellation detected during Pyrogram upload for chat_id {chat_id}")
+    # Use composite key (chat_id, video_id)
+    operation_key = (chat_id, video_id)
+    if active_operations.get(operation_key, {}).get("cancelled", False):
+        logger.info(f"Cancellation detected during Pyrogram upload for chat_id {chat_id}, video_id {video_id}")
         raise Exception("Upload cancelled by user")
 
     if now - last_edit_time > 1.0:  # Edit at most once per second
@@ -595,7 +602,7 @@ async def pyrogram_upload_progress(
                 text=f"Uploading: {percentage}%",
                 chat_id=chat_id,
                 message_id=message_id,
-                reply_markup=get_cancel_keyboard(chat_id),
+                reply_markup=get_cancel_keyboard(chat_id, video_id),
             )
             progress_message_last_edit_time[(chat_id, message_id)] = now
             logger.debug(
@@ -625,6 +632,7 @@ async def send_audio_with_pyrogram(
     file_path: str,
     ptb_bot_instance,
     processing_message_ptb: Update | None,
+    video_id: str,
     caption: str | None = None,
 ) -> bool:
     """Send an audio file using Pyrogram, suitable for larger files."""
@@ -649,6 +657,7 @@ async def send_audio_with_pyrogram(
             processing_message_ptb.chat_id,
             processing_message_ptb.message_id,
             ptb_bot_instance,
+            video_id,
         )
     else:
         logger.warning(
@@ -770,15 +779,16 @@ async def process_audio_download(
     audio_file_path = None
     audio_sent_successfully = False
 
-    # Register this operation as active (for cancellation support)
-    active_operations[chat_id] = {"cancelled": False, "file_path": None}
+    # Use composite key (chat_id, video_id) for cancellation support
+    operation_key = (chat_id, video_id)
+    active_operations[operation_key] = {"cancelled": False, "file_path": None}
 
     try:
         # Edit the original message to show processing status with cancel button
         try:
             await query.edit_message_text(
                 "Processing audio...",
-                reply_markup=get_cancel_keyboard(chat_id)
+                reply_markup=get_cancel_keyboard(chat_id, video_id)
             )
             processing_message = query.message
         except Exception as e:
@@ -788,10 +798,10 @@ async def process_audio_download(
 
         # Store file path for cleanup
         if audio_file_path:
-            active_operations[chat_id]["file_path"] = audio_file_path
+            active_operations[operation_key]["file_path"] = audio_file_path
 
         # Check if cancelled
-        if active_operations.get(chat_id, {}).get("cancelled", False):
+        if active_operations.get(operation_key, {}).get("cancelled", False):
             if audio_file_path and os.path.exists(audio_file_path):
                 try:
                     os.remove(audio_file_path)
@@ -821,7 +831,7 @@ async def process_audio_download(
                     try:
                         await processing_message.edit_text(
                             "Uploading audio: 0%",
-                            reply_markup=get_cancel_keyboard(chat_id)
+                            reply_markup=get_cancel_keyboard(chat_id, video_id)
                         )
                     except Exception:
                         pass
@@ -831,11 +841,12 @@ async def process_audio_download(
                     audio_file_path,
                     context.bot,
                     processing_message,
+                    video_id,
                     caption=f"🎵 Audio from YouTube",
                 )
 
                 # Check if cancelled during upload
-                if active_operations.get(chat_id, {}).get("cancelled", False):
+                if active_operations.get(operation_key, {}).get("cancelled", False):
                     if processing_message:
                         try:
                             await processing_message.edit_text(
@@ -871,7 +882,7 @@ async def process_audio_download(
                     try:
                         await processing_message.edit_text(
                             "Uploading audio...",
-                            reply_markup=get_cancel_keyboard(chat_id)
+                            reply_markup=get_cancel_keyboard(chat_id, video_id)
                         )
                     except Exception:
                         pass
@@ -932,8 +943,8 @@ async def process_audio_download(
         )
 
     finally:
-        # Clean up active operation
-        active_operations.pop(chat_id, None)
+        # Clean up active operation using composite key
+        active_operations.pop(operation_key, None)
 
         # Cleanup temp file
         if audio_file_path and os.path.exists(audio_file_path):
@@ -957,8 +968,9 @@ async def process_video_download(
     video_file_path = None
     video_sent_successfully = False
 
-    # Register this operation as active (for cancellation support)
-    active_operations[chat_id] = {"cancelled": False, "file_path": None}
+    # Use composite key (chat_id, video_id) for cancellation support
+    operation_key = (chat_id, video_id)
+    active_operations[operation_key] = {"cancelled": False, "file_path": None}
 
     try:
         # Create local progress tracker for this download
@@ -972,7 +984,7 @@ async def process_video_download(
         try:
             await query.edit_message_text(
                 f"Downloading {quality}p: 0%",
-                reply_markup=get_cancel_keyboard(chat_id)
+                reply_markup=get_cancel_keyboard(chat_id, video_id)
             )
             processing_message = query.message
         except Exception as e:
@@ -996,8 +1008,8 @@ async def process_video_download(
                 await asyncio.sleep(1.5)  # Check every 1.5 seconds
 
                 # Check if cancelled
-                if active_operations.get(chat_id, {}).get("cancelled", False):
-                    logger.info(f"Download cancelled for chat_id: {chat_id}")
+                if active_operations.get(operation_key, {}).get("cancelled", False):
+                    logger.info(f"Download cancelled for chat_id: {chat_id}, video_id: {video_id}")
                     # We can't stop the download thread, but we'll clean up after
                     break
 
@@ -1011,7 +1023,7 @@ async def process_video_download(
                         try:
                             await processing_message.edit_text(
                                 progress_text,
-                                reply_markup=get_cancel_keyboard(chat_id)
+                                reply_markup=get_cancel_keyboard(chat_id, video_id)
                             )
                             last_progress_text = progress_text
                             last_update_time = current_time
@@ -1019,7 +1031,7 @@ async def process_video_download(
                             logger.debug(f"Could not update progress: {e}")
 
             # Check if operation was cancelled
-            if active_operations.get(chat_id, {}).get("cancelled", False):
+            if active_operations.get(operation_key, {}).get("cancelled", False):
                 # Don't wait for download to complete - show cancelled message immediately
                 if processing_message:
                     try:
@@ -1031,7 +1043,7 @@ async def process_video_download(
                         pass
 
                 # Clean up active operation
-                active_operations.pop(chat_id, None)
+                active_operations.pop(operation_key, None)
 
                 # Wait for download to finish in background then clean up file
                 try:
@@ -1049,8 +1061,8 @@ async def process_video_download(
             video_file_path = future.result()
 
             # Store file path for cleanup (use .get() in case operation was cancelled)
-            if video_file_path and chat_id in active_operations:
-                active_operations[chat_id]["file_path"] = video_file_path
+            if video_file_path and operation_key in active_operations:
+                active_operations[operation_key]["file_path"] = video_file_path
 
         if video_file_path:
             file_size = os.path.getsize(video_file_path)
@@ -1076,7 +1088,7 @@ async def process_video_download(
                     try:
                         await processing_message.edit_text(
                             f"Uploading video: 0%",
-                            reply_markup=get_cancel_keyboard(chat_id)
+                            reply_markup=get_cancel_keyboard(chat_id, video_id)
                         )
                     except Exception:
                         pass
@@ -1086,11 +1098,12 @@ async def process_video_download(
                     video_file_path,
                     context.bot,
                     processing_message,
+                    video_id,
                     caption=f"🎬 {quality}p video from YouTube",
                 )
 
                 # Check if cancelled during upload
-                if active_operations.get(chat_id, {}).get("cancelled", False):
+                if active_operations.get(operation_key, {}).get("cancelled", False):
                     if processing_message:
                         try:
                             await processing_message.edit_text(
@@ -1126,7 +1139,7 @@ async def process_video_download(
                     try:
                         await processing_message.edit_text(
                             "Uploading video...",
-                            reply_markup=get_cancel_keyboard(chat_id)
+                            reply_markup=get_cancel_keyboard(chat_id, video_id)
                         )
                     except Exception:
                         pass
@@ -1186,8 +1199,8 @@ async def process_video_download(
         )
     
     finally:
-        # Clean up active operation
-        active_operations.pop(chat_id, None)
+        # Clean up active operation using composite key
+        active_operations.pop(operation_key, None)
 
         # Cleanup temp file
         if video_file_path and os.path.exists(video_file_path):
@@ -1536,6 +1549,7 @@ async def send_video_with_pyrogram(
     file_path: str,
     ptb_bot_instance,
     processing_message_ptb,
+    video_id: str,
     caption: str | None = None,
 ) -> bool:
     """Send a video file using Pyrogram, suitable for larger files."""
@@ -1556,6 +1570,7 @@ async def send_video_with_pyrogram(
             processing_message_ptb.chat_id,
             processing_message_ptb.message_id,
             ptb_bot_instance,
+            video_id,
         )
 
     try:
