@@ -52,6 +52,9 @@ TEMP_FILE_MAX_AGE_SECONDS = 60 * 60  # 1 hour
 CLEANUP_INTERVAL_SECONDS = 10 * 60  # Run cleanup every 10 minutes
 TEMP_DIR = Path("temp_downloads")
 
+# Server location for user-friendly geo-restriction messages
+SERVER_COUNTRY = "Germany"  # Update this if you move the server
+
 # --- Global State ---
 # Semaphore to limit concurrent downloads
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -906,26 +909,30 @@ async def process_audio_download(
             try:
                 audio_file_path = await download_and_convert_youtube(youtube_url, video_id)
             except YouTubeError as yt_err:
-                # Show the YouTube error directly to the user
-                error_message = str(yt_err)
-                logger.info(f"Showing YouTube error to user: {error_message}")
+                # Show the YouTube error in a user-friendly format
+                raw_error = str(yt_err)
+                user_message = format_youtube_error_for_user(raw_error)
+                logger.info(f"Showing YouTube error to user: {raw_error}")
                 if processing_message:
                     try:
                         await processing_message.edit_text(
-                            f"{error_message}",
-                            reply_markup=get_info_inline_keyboard()
+                            user_message,
+                            reply_markup=get_info_inline_keyboard(),
+                            parse_mode="Markdown"
                         )
                     except Exception:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"{error_message}",
+                            text=user_message,
                             reply_markup=get_info_inline_keyboard(),
+                            parse_mode="Markdown"
                         )
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"{error_message}",
+                        text=user_message,
                         reply_markup=get_info_inline_keyboard(),
+                        parse_mode="Markdown"
                     )
                 return
 
@@ -1219,26 +1226,30 @@ async def process_video_download(
                 try:
                     video_file_path = future.result()
                 except YouTubeError as yt_err:
-                    # Show the YouTube error directly to the user
-                    error_message = str(yt_err)
-                    logger.info(f"Showing YouTube error to user: {error_message}")
+                    # Show the YouTube error in a user-friendly format
+                    raw_error = str(yt_err)
+                    user_message = format_youtube_error_for_user(raw_error)
+                    logger.info(f"Showing YouTube error to user: {raw_error}")
                     if processing_message:
                         try:
                             await processing_message.edit_text(
-                                f"{error_message}",
-                                reply_markup=get_info_inline_keyboard()
+                                user_message,
+                                reply_markup=get_info_inline_keyboard(),
+                                parse_mode="Markdown"
                             )
                         except Exception:
                             await context.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"{error_message}",
+                                text=user_message,
                                 reply_markup=get_info_inline_keyboard(),
+                                parse_mode="Markdown"
                             )
                     else:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"{error_message}",
+                            text=user_message,
                             reply_markup=get_info_inline_keyboard(),
+                            parse_mode="Markdown"
                         )
                     return
 
@@ -1419,6 +1430,88 @@ def sanitize_filename(title: str, max_length: int = 200) -> str:
 class YouTubeError(Exception):
     """Custom exception for YouTube-specific errors that should be shown to users."""
     pass
+
+
+def format_youtube_error_for_user(error_message: str) -> str:
+    """
+    Convert technical YouTube/yt-dlp error messages into user-friendly messages.
+    
+    Args:
+        error_message: The raw error message from yt-dlp
+    
+    Returns:
+        A user-friendly error message
+    """
+    error_lower = error_message.lower()
+    
+    # Geo-restriction errors
+    if "not made this video available in your country" in error_lower:
+        return (
+            f"🌍 **Region Restricted**\n\n"
+            f"This video is not available in {SERVER_COUNTRY} (where this bot's server is located).\n\n"
+            f"The uploader has restricted this video to certain countries only."
+        )
+    
+    if "video is not available" in error_lower and "country" in error_lower:
+        return (
+            f"🌍 **Region Restricted**\n\n"
+            f"This video is blocked in {SERVER_COUNTRY}.\n\n"
+            f"Try a video that's available worldwide."
+        )
+    
+    # Age restriction
+    if "age" in error_lower and ("restricted" in error_lower or "confirm" in error_lower):
+        return (
+            "🔞 **Age Restricted**\n\n"
+            "This video requires age verification which the bot cannot bypass."
+        )
+    
+    # Sign-in required
+    if "sign in" in error_lower or "login" in error_lower:
+        return (
+            "🔐 **Login Required**\n\n"
+            "This video requires signing in to YouTube, which the bot cannot do."
+        )
+    
+    # Private video
+    if "private video" in error_lower:
+        return (
+            "🔒 **Private Video**\n\n"
+            "This video is private and cannot be downloaded."
+        )
+    
+    # Video unavailable
+    if "video unavailable" in error_lower or "removed" in error_lower:
+        return (
+            "❌ **Video Unavailable**\n\n"
+            "This video has been removed or is no longer available."
+        )
+    
+    # Live stream
+    if "live" in error_lower and ("event" in error_lower or "stream" in error_lower):
+        return (
+            "📺 **Live Content**\n\n"
+            "Live streams cannot be downloaded. Wait until the stream ends and try again."
+        )
+    
+    # Premiere
+    if "premiere" in error_lower:
+        return (
+            "🎬 **Upcoming Premiere**\n\n"
+            "This video hasn't premiered yet. Try again after it's released."
+        )
+    
+    # Copyright claim
+    if "copyright" in error_lower:
+        return (
+            "©️ **Copyright Blocked**\n\n"
+            "This video is blocked due to copyright restrictions."
+        )
+    
+    # Default: clean up the error message a bit
+    # Remove "ERROR: [youtube] VIDEO_ID:" prefix if present
+    cleaned = re.sub(r"ERROR:\s*\[youtube\]\s*[\w-]+:\s*", "", error_message)
+    return f"❌ **Download Failed**\n\n{cleaned}"
 
 
 async def download_and_convert_youtube(url: str, video_id: str) -> str | None:
